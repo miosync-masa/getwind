@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GET Wind™ v6.3 JAX Edition - FULLY JIT-Compatible Vortex Tracking
-環ちゃん & ご主人さま Complete JIT Edition with FULL Features! 💕
+GET Wind™ v6.3 JAX Edition - FULLY JIT-Compatible Vortex Tracking with Smart Death
+環ちゃん & ご主人さま Ultimate Intelligence Edition! 💕
 
-Boolean Indexingを完全排除！全機能を維持しつつ完全JIT対応！
-- 新規渦の追加：完全実装
-- 既存渦の更新：完全実装
-- 剥離統計：正しくカウント
-- Strouhal数計算：Boolean indexing排除版
+完全JIT対応 + 賢い渦死判定システム統合版！
+- Boolean Indexingを完全排除
+- ΛF同期ベースの健康状態評価
+- 位相ラグを考慮した同期判定
+- 物理的に正しい生死判定
 """
 
 import jax
@@ -99,6 +99,126 @@ def initialize_vortex_state(max_vortices: int = 100,
     )
 
 # ==============================
+# 🆕 渦の健康状態評価（Smart Death用）
+# ==============================
+
+@jit
+def compute_vortex_health(
+    coherence: float,
+    circulation: float,
+    n_particles: int,
+    coherence_history: jnp.ndarray,
+    circulation_history: jnp.ndarray,
+    particle_history: jnp.ndarray,
+    history_len: int = 10
+) -> dict:
+    """
+    渦の健康状態を総合的に評価
+    """
+    
+    # === 1. ΛF同期の健康度 ===
+    current_sync = coherence
+    valid_history = coherence_history >= 0
+    n_valid = jnp.sum(valid_history)
+    
+    mean_coherence = jnp.sum(
+        jnp.where(valid_history, coherence_history, 0)
+    ) / jnp.maximum(n_valid, 1)
+    
+    variance = jnp.sum(
+        jnp.where(valid_history, (coherence_history - mean_coherence)**2, 0)
+    ) / jnp.maximum(n_valid, 1)
+    std_coherence = jnp.sqrt(variance)
+    cv_coherence = std_coherence / (mean_coherence + 1e-8)
+    
+    sync_health = current_sync * jnp.exp(-cv_coherence)
+    
+    # === 2. 構造の健康度 ===
+    sync_particles = n_particles * coherence
+    min_particles_for_vortex = 3.0
+    particle_ratio = sync_particles / min_particles_for_vortex
+    
+    particle_mean = jnp.mean(particle_history)
+    particle_std = jnp.std(particle_history)
+    particle_stability = jnp.exp(-particle_std / (particle_mean + 1e-8))
+    
+    structure_health = jnp.tanh(particle_ratio) * particle_stability
+    
+    # === 3. 活力（循環の強さ）===
+    current_vitality = jnp.tanh(jnp.abs(circulation) / 5.0)
+    circ_diffs = jnp.diff(circulation_history)
+    decay_rate = jnp.mean(circ_diffs)
+    decay_penalty = jnp.exp(decay_rate / 2.0)
+    vitality = current_vitality * decay_penalty
+    
+    # === 4. 安定性 ===
+    # 簡易版のトレンド計算（polyfit使わない）
+    x = jnp.arange(history_len, dtype=jnp.float32)
+    x_mean = jnp.mean(x)
+    y_mean_coh = jnp.mean(coherence_history)
+    y_mean_circ = jnp.mean(circulation_history)
+    
+    coherence_trend = jnp.sum((x - x_mean) * (coherence_history - y_mean_coh)) / (jnp.sum((x - x_mean)**2) + 1e-8)
+    circulation_trend = jnp.sum((x - x_mean) * (circulation_history - y_mean_circ)) / (jnp.sum((x - x_mean)**2) + 1e-8)
+    
+    trend_score = jnp.tanh((coherence_trend + circulation_trend) * 10)
+    stability = 0.5 + 0.5 * trend_score
+    
+    # === 5. 総合健康度 ===
+    overall_health = (
+        0.4 * sync_health +
+        0.25 * structure_health +
+        0.2 * vitality +
+        0.15 * stability
+    )
+    
+    return {
+        'sync_health': sync_health,
+        'structure_health': structure_health,
+        'vitality': vitality,
+        'stability': stability,
+        'overall_health': overall_health
+    }
+
+# ==============================
+# 🆕 位相ラグを考慮した同期評価
+# ==============================
+
+@jit
+def evaluate_phase_lag_sync(
+    Lambda_F: jnp.ndarray,
+    positions: jnp.ndarray,
+    vortex_center: jnp.ndarray,
+    mask: jnp.ndarray,
+    max_lag: float = 0.2
+) -> float:
+    """
+    位相ラグを考慮したΛF同期の評価
+    """
+    
+    rel_pos = positions - vortex_center[None, :]
+    distances = jnp.linalg.norm(rel_pos, axis=1)
+    
+    expected_tangent = jnp.stack([-rel_pos[:, 1], rel_pos[:, 0]], axis=1)
+    expected_tangent = expected_tangent / (jnp.linalg.norm(expected_tangent, axis=1, keepdims=True) + 1e-8)
+    
+    Lambda_F_normalized = Lambda_F / (jnp.linalg.norm(Lambda_F, axis=1, keepdims=True) + 1e-8)
+    alignment = jnp.sum(Lambda_F_normalized * expected_tangent, axis=1)
+    
+    phase_lag_weight = jnp.exp(-distances / 20.0)
+    
+    lag_adjusted_sync = jnp.where(
+        mask,
+        jnp.maximum(alignment, 0.5 + 0.5 * phase_lag_weight),
+        0.0
+    )
+    
+    total_weight = jnp.sum(jnp.where(mask, phase_lag_weight, 0))
+    phase_sync_score = jnp.sum(lag_adjusted_sync * phase_lag_weight) / jnp.maximum(total_weight, 1e-8)
+    
+    return phase_sync_score
+
+# ==============================
 # 渦クラスタ検出（完全JIT対応版）
 # ==============================
 
@@ -109,7 +229,7 @@ def detect_vortex_clusters_separated(
     Q_criterion: jnp.ndarray,
     active_mask: jnp.ndarray,
     obstacle_center: jnp.ndarray,
-    side: int,  # 0=upper, 1=lower
+    side: int,
     grid_size: int = 10,
     min_particles: int = 10
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -117,11 +237,9 @@ def detect_vortex_clusters_separated(
     N = positions.shape[0]
     max_clusters = 25
     
-    # Y方向のオフセット
     y_offset = jnp.where(side == 0, 20.0, -20.0)
     y_center = obstacle_center[1] + y_offset
     
-    # 対象領域のマスク
     y_min = jnp.where(side == 0, y_center - 10, y_center - 30)
     y_max = jnp.where(side == 0, y_center + 30, y_center + 10)
     
@@ -132,7 +250,6 @@ def detect_vortex_clusters_separated(
         (positions[:, 1] <= y_max)
     )
     
-    # グリッド化
     grid_scale = 20.0
     grid_indices = jnp.floor(positions / grid_scale).astype(jnp.int32)
     grid_ids = grid_indices[:, 0] * 1000 + grid_indices[:, 1]
@@ -189,44 +306,35 @@ def match_vortices_vectorized(
     dt: float,
     matching_threshold: float = 30.0
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """既存渦と新規検出クラスタのマッチング（Boolean Indexing完全排除版）"""
+    """既存渦と新規検出クラスタのマッチング"""
     max_vortices = len(vortex_state.ids)
     max_clusters = len(new_centers)
     
-    # 予測位置の計算
     predicted_centers = vortex_state.centers + jnp.array([10.0 * dt, 0])
     
-    # 全渦×全クラスタの距離行列を計算
-    # Boolean indexingを避けて、非アクティブな渦は無限大の距離にする
     distances_all = jnp.linalg.norm(
         predicted_centers[:, None, :] - new_centers[None, :, :],
         axis=2
     )
     
-    # 非アクティブな渦の距離を無限大に設定（マスキング）
     distances_masked = jnp.where(
-        vortex_state.is_alive[:, None],  # (max_vortices, 1) にブロードキャスト
-        distances_all,                    # アクティブなら距離を使用
-        jnp.inf                           # 非アクティブなら無限大
+        vortex_state.is_alive[:, None],
+        distances_all,
+        jnp.inf
     )
     
-    # 有効なクラスタのマスク（循環が十分強い）
     valid_clusters = new_properties[:, 0] > 0.5
     
-    # 各クラスタに最も近い渦を探す
-    min_distances = jnp.min(distances_masked, axis=0)  # (max_clusters,)
-    min_indices = jnp.argmin(distances_masked, axis=0)  # (max_clusters,)
+    min_distances = jnp.min(distances_masked, axis=0)
+    min_indices = jnp.argmin(distances_masked, axis=0)
     
-    # マッチング結果（渦のインデックスをそのまま使用）
     matches = jnp.where(
         (min_distances < matching_threshold) & valid_clusters,
-        min_indices,  # 渦のインデックス
+        min_indices,
         -1
     )
     
-    # 各渦がマッチしたかのフラグを計算
     def check_matched(vid):
-        # この渦がどれかのクラスタにマッチしたか
         return jnp.any(matches == vid)
     
     is_matched = vmap(check_matched)(jnp.arange(max_vortices))
@@ -234,88 +342,26 @@ def match_vortices_vectorized(
     return matches, is_matched
 
 # ==============================
-# ★★★ Strouhal数計算（完全JIT対応版）★★★
+# 🆕 賢い渦状態更新（Smart Death統合版）
 # ==============================
 
 @jit
-def compute_strouhal_number(
-    vortex_state: VortexStateJAX,
-    dt: float,
-    D: float,
-    U: float
-) -> float:
-    """Strouhal数の計算（Boolean Indexing排除版）"""
-    
-    # 上側渦の誕生ステップを抽出（マスキング版）
-    upper_vortices_mask = (vortex_state.birth_side == 0) & (vortex_state.birth_steps >= 0)
-    
-    # 有効なステップにマスクを適用（無効な値は大きな負の値に）
-    masked_steps = jnp.where(
-        upper_vortices_mask,
-        vortex_state.birth_steps,
-        -999999  # 無効な値は非常に小さく
-    )
-    
-    # ソート（小さい値は最初に来る）
-    sorted_steps = jnp.sort(masked_steps)
-    
-    # 有効な値の数を数える（-999999でない値）
-    valid_count = jnp.sum(sorted_steps >= 0)
-    
-    # 最後のN個を取る（固定サイズ配列として）
-    n_recent = jnp.minimum(10, valid_count - 1)
-    
-    # インデックスを計算（動的インデックスを避ける）
-    # 最後から10個分のインデックスを事前に計算
-    indices = jnp.arange(len(sorted_steps))
-    recent_mask = indices >= (len(sorted_steps) - n_recent - 1)
-    
-    # マスクを使って最近の値を抽出（固定サイズ）
-    recent_steps = jnp.where(recent_mask, sorted_steps, 0)
-    
-    # 間隔を計算（固定サイズのdiff）
-    def compute_diff(i):
-        # i番目とi+1番目の差を計算
-        is_valid = (i < len(recent_steps) - 1) & (recent_steps[i] >= 0) & (recent_steps[i+1] >= 0)
-        diff = jnp.where(is_valid, recent_steps[i+1] - recent_steps[i], 0)
-        return diff
-    
-    # 全ての差分を計算
-    intervals_array = vmap(compute_diff)(jnp.arange(len(recent_steps) - 1))
-    
-    # 有効な間隔のみを使って平均を計算
-    valid_intervals_mask = intervals_array > 0
-    valid_intervals_sum = jnp.sum(jnp.where(valid_intervals_mask, intervals_array, 0))
-    valid_intervals_count = jnp.sum(valid_intervals_mask)
-    
-    mean_interval = jnp.where(
-        valid_intervals_count > 0,
-        valid_intervals_sum / valid_intervals_count,
-        1.0
-    )
-    
-    # Strouhal数を計算
-    period = mean_interval * dt
-    frequency = 1.0 / (period + 1e-8)
-    St = frequency * D / U
-    
-    # 有効な値がある場合のみSt数を返す
-    return jnp.where(valid_intervals_count > 0, St, 0.0)
-
-# ==============================
-# 渦状態更新（簡略版だけど完全JIT対応）
-# ==============================
-
-@jit
-def update_vortex_state(
+def update_vortex_state_smart(
     vortex_state: VortexStateJAX,
     matches: jnp.ndarray,
     new_centers: jnp.ndarray,
     new_properties: jnp.ndarray,
+    sides_array: jnp.ndarray,
+    Lambda_F: jnp.ndarray,       # 全粒子のΛF
+    positions: jnp.ndarray,      # 全粒子の位置
+    particle_cluster_ids: jnp.ndarray,  # 粒子のクラスタID
     step: int,
-    next_id: int
-) -> Tuple[VortexStateJAX, int]:
-    """渦状態の更新（完全版・JIT対応）"""
+    next_id: int,
+    death_threshold: float = 0.2
+) -> Tuple[VortexStateJAX, int, Dict]:
+    """
+    賢い死の判定を統合した渦状態更新
+    """
     
     max_vortices = len(vortex_state.ids)
     
@@ -327,7 +373,6 @@ def update_vortex_state(
     )
     
     # === 既存渦の更新 ===
-    # マッチング情報の整理
     vortex_to_cluster = jnp.full(max_vortices, -1, dtype=jnp.int32)
     
     def assign_match(carry, i):
@@ -349,7 +394,6 @@ def update_vortex_state(
         jnp.arange(len(matches))
     )
     
-    # 更新値を計算
     has_match = vortex_to_cluster >= 0
     matched_cluster_ids = jnp.clip(vortex_to_cluster, 0, len(new_centers)-1)
     
@@ -377,14 +421,107 @@ def update_vortex_state(
         vortex_state.n_particles
     )
     
-    # === 新規渦の作成（完全実装！）===
-    # 新規渦候補を検出（マッチしない＆十分強い）
-    is_new_vortex = (matches == -1) & (new_properties[:, 0] > 1.0)
+    # === 履歴の更新 ===
+    # coherence履歴
+    def update_coherence_hist(i):
+        hist_idx = new_hist_indices[i]
+        should_update = vortex_state.is_alive[i]
+        return jnp.where(
+            should_update,
+            vortex_state.coherence_hist[i].at[hist_idx].set(new_coherences_all[i]),
+            vortex_state.coherence_hist[i]
+        )
     
-    # 空きスロットを探す（Boolean indexingを避ける）
+    new_coherence_hist = vmap(update_coherence_hist)(jnp.arange(max_vortices))
+    
+    # circulation履歴
+    def update_circulation_hist(i):
+        hist_idx = new_hist_indices[i]
+        should_update = vortex_state.is_alive[i]
+        return jnp.where(
+            should_update,
+            vortex_state.circulation_hist[i].at[hist_idx].set(new_circulations_all[i]),
+            vortex_state.circulation_hist[i]
+        )
+    
+    new_circulation_hist = vmap(update_circulation_hist)(jnp.arange(max_vortices))
+    
+    # particle count履歴
+    def update_particle_hist(i):
+        hist_idx = new_hist_indices[i]
+        should_update = vortex_state.is_alive[i]
+        return jnp.where(
+            should_update,
+            vortex_state.particle_count_hist[i].at[hist_idx].set(new_n_particles_all[i]),
+            vortex_state.particle_count_hist[i]
+        )
+    
+    new_particle_count_hist = vmap(update_particle_hist)(jnp.arange(max_vortices))
+    
+    # === 🆕 賢い死の判定 ===
+    def evaluate_vortex_health(i):
+        is_alive = vortex_state.is_alive[i]
+        
+        # 履歴を取得（最近の10個）
+        history_len = 10
+        hist_idx = new_hist_indices[i]
+        
+        # 循環バッファから最近のデータを取得
+        indices = jnp.arange(history_len)
+        hist_indices = (hist_idx - history_len + 1 + indices) % new_coherence_hist[i].shape[0]
+        
+        coherence_history = new_coherence_hist[i][hist_indices]
+        circulation_history = new_circulation_hist[i][hist_indices]
+        particle_history = new_particle_count_hist[i][hist_indices].astype(jnp.float32)
+        
+        # 健康状態評価
+        health = compute_vortex_health(
+            new_coherences_all[i],
+            new_circulations_all[i],
+            new_n_particles_all[i],
+            coherence_history,
+            circulation_history,
+            particle_history,
+            history_len
+        )
+        
+        # 位相ラグ同期評価
+        # この渦に属する粒子のマスク（クラスタIDベース）
+        vortex_cluster_id = vortex_to_cluster[i]
+        particle_mask = jnp.where(
+            vortex_cluster_id >= 0,
+            particle_cluster_ids == vortex_cluster_id,
+            jnp.zeros_like(particle_cluster_ids, dtype=bool)
+        )
+        
+        phase_sync = evaluate_phase_lag_sync(
+            Lambda_F, positions, new_centers_all[i], particle_mask
+        )
+        
+        # 最終健康スコア
+        final_sync_health = health['sync_health'] * 0.7 + phase_sync * 0.3
+        final_structure_health = health['structure_health']
+        
+        final_health_score = (
+            0.35 * final_sync_health +
+            0.25 * final_structure_health +
+            0.2 * health['vitality'] +
+            0.2 * health['stability']
+        )
+        
+        # 死の判定
+        should_die = is_alive & (final_health_score < death_threshold)
+        
+        return should_die, final_health_score
+    
+    death_results = vmap(evaluate_vortex_health)(jnp.arange(max_vortices))
+    should_die_array = death_results[0]
+    health_scores = death_results[1]
+    
+    # === 新規渦の作成 ===
+    is_new_vortex = (matches == -1) & (new_properties[:, 0] > 1.0)
     empty_mask = ~vortex_state.is_alive
     
-    # 各スロットにインデックスを付与（空いてない場合は大きな値）
     slot_indices = jnp.where(empty_mask, jnp.arange(max_vortices), max_vortices)
     sorted_slots = jnp.sort(slot_indices)
     
@@ -392,20 +529,17 @@ def update_vortex_state(
     def add_new_vortex(carry, i):
         state, current_id = carry
         
-        # i番目の新規渦候補を探す
         new_vortex_indices = jnp.where(is_new_vortex, jnp.arange(len(matches)), -1)
         sorted_new_indices = jnp.sort(new_vortex_indices)
         
-        # i番目の新規渦のインデックス（無効な場合は0）
         cluster_idx = jnp.where(i < jnp.sum(is_new_vortex), sorted_new_indices[-(i+1)], 0)
-        
-        # i番目の空きスロット
         slot_idx = sorted_slots[i]
         
-        # 有効な追加かチェック
         is_valid_add = (i < jnp.sum(is_new_vortex)) & (slot_idx < max_vortices) & (cluster_idx >= 0)
         
-        # 状態を更新
+        # 誕生側の判定
+        birth_side = jnp.where(cluster_idx < len(sides_array), sides_array[cluster_idx], 0)
+        
         state = state._replace(
             ids=state.ids.at[slot_idx].set(
                 jnp.where(is_valid_add, current_id, state.ids[slot_idx])
@@ -415,6 +549,9 @@ def update_vortex_state(
             ),
             birth_steps=state.birth_steps.at[slot_idx].set(
                 jnp.where(is_valid_add, step, state.birth_steps[slot_idx])
+            ),
+            birth_side=state.birth_side.at[slot_idx].set(
+                jnp.where(is_valid_add, birth_side, state.birth_side[slot_idx])
             ),
             centers=state.centers.at[slot_idx].set(
                 jnp.where(is_valid_add, new_centers[cluster_idx], state.centers[slot_idx])
@@ -439,7 +576,10 @@ def update_vortex_state(
         circulations=new_circulations_all,
         coherences=new_coherences_all,
         n_particles=new_n_particles_all,
-        hist_index=new_hist_indices
+        hist_index=new_hist_indices,
+        coherence_hist=new_coherence_hist,
+        circulation_hist=new_circulation_hist,
+        particle_count_hist=new_particle_count_hist
     )
     
     # 最大10個の新規渦を追加
@@ -450,50 +590,87 @@ def update_vortex_state(
         jnp.arange(max_new_vortices)
     )
     
-    # === 消滅判定 ===
-    should_die = final_state.is_alive & (
-        (final_state.n_particles < 5) | 
-        (final_state.coherences < 0.2)
-    )
-    
+    # === 死亡処理 ===
     final_state = final_state._replace(
-        is_alive=final_state.is_alive & ~should_die,
-        death_steps=jnp.where(should_die, step, final_state.death_steps)
+        is_alive=final_state.is_alive & ~should_die_array,
+        death_steps=jnp.where(should_die_array, step, final_state.death_steps)
     )
     
-    return final_state, final_next_id
+    # 診断情報
+    diagnostics = {
+        'health_scores': health_scores,
+        'n_deaths': jnp.sum(should_die_array),
+        'mean_health': jnp.mean(jnp.where(final_state.is_alive, health_scores, 0))
+    }
+    
+    return final_state, final_next_id, diagnostics
 
 # ==============================
-# メイン追跡関数（完全JIT対応版）
+# Strouhal数計算（完全JIT対応版）
 # ==============================
+
+@jit
+def compute_strouhal_number(
+    vortex_state: VortexStateJAX,
+    dt: float,
+    D: float,
+    U: float
+) -> float:
+    """Strouhal数の計算（Boolean Indexing排除版）"""
+    
+    upper_vortices_mask = (vortex_state.birth_side == 0) & (vortex_state.birth_steps >= 0)
+    
+    masked_steps = jnp.where(
+        upper_vortices_mask,
+        vortex_state.birth_steps,
+        -999999
+    )
+    
+    sorted_steps = jnp.sort(masked_steps)
+    valid_count = jnp.sum(sorted_steps >= 0)
+    
+    n_recent = jnp.minimum(10, valid_count - 1)
+    indices = jnp.arange(len(sorted_steps))
+    recent_mask = indices >= (len(sorted_steps) - n_recent - 1)
+    
+    recent_steps = jnp.where(recent_mask, sorted_steps, 0)
+    
+    def compute_diff(i):
+        is_valid = (i < len(recent_steps) - 1) & (recent_steps[i] >= 0) & (recent_steps[i+1] >= 0)
+        diff = jnp.where(is_valid, recent_steps[i+1] - recent_steps[i], 0)
+        return diff
+    
+    intervals_array = vmap(compute_diff)(jnp.arange(len(recent_steps) - 1))
+    
+    valid_intervals_mask = intervals_array > 0
+    valid_intervals_sum = jnp.sum(jnp.where(valid_intervals_mask, intervals_array, 0))
+    valid_intervals_count = jnp.sum(valid_intervals_mask)
+    
+    mean_interval = jnp.where(
+        valid_intervals_count > 0,
+        valid_intervals_sum / valid_intervals_count,
+        1.0
+    )
+    
+    period = mean_interval * dt
+    frequency = 1.0 / (period + 1e-8)
+    St = frequency * D / U
+    
+    return jnp.where(valid_intervals_count > 0, St, 0.0)
+
+# ==============================
+# 剥離統計更新
+# ==============================
+
 @jit
 def update_shedding_stats(
-    stats: 'VortexSheddingStats',  # 型ヒントは文字列で
+    stats: VortexSheddingStats,
     has_new_upper: bool,
     has_new_lower: bool,
     step: int
-) -> 'VortexSheddingStats':
-    """
-    剥離統計の更新（Boolean Indexing完全排除版）
+) -> VortexSheddingStats:
+    """剥離統計の更新"""
     
-    Parameters:
-    -----------
-    stats : VortexSheddingStats
-        現在の剥離統計
-    has_new_upper : bool
-        上側に新規渦が発生したか
-    has_new_lower : bool
-        下側に新規渦が発生したか
-    step : int
-        現在のステップ数
-        
-    Returns:
-    --------
-    VortexSheddingStats
-        更新された剥離統計
-    """
-    
-    # 上側の更新
     new_upper_count = lax.cond(
         has_new_upper,
         lambda x: x + 1,
@@ -501,13 +678,10 @@ def update_shedding_stats(
         stats.upper_count
     )
     
-    # 上側のステップ配列を更新（Boolean indexingを避ける）
     def update_upper_steps(carry):
         steps, count = carry
-        # 現在のカウントを配列インデックスとして使用（モジュロで循環）
         idx = count % steps.shape[0]
         
-        # has_new_upperがTrueの場合のみ更新
         new_steps = lax.cond(
             has_new_upper,
             lambda s: s.at[idx].set(step),
@@ -518,7 +692,6 @@ def update_shedding_stats(
     
     new_upper_steps = update_upper_steps((stats.upper_shedding_steps, stats.upper_count))
     
-    # 下側の更新
     new_lower_count = lax.cond(
         has_new_lower,
         lambda x: x + 1,
@@ -526,7 +699,6 @@ def update_shedding_stats(
         stats.lower_count
     )
     
-    # 下側のステップ配列を更新
     def update_lower_steps(carry):
         steps, count = carry
         idx = count % steps.shape[0]
@@ -541,7 +713,6 @@ def update_shedding_stats(
     
     new_lower_steps = update_lower_steps((stats.lower_shedding_steps, stats.lower_count))
     
-    # 更新された統計を返す
     return stats._replace(
         upper_shedding_steps=new_upper_steps,
         lower_shedding_steps=new_lower_steps,
@@ -549,18 +720,22 @@ def update_shedding_stats(
         lower_count=new_lower_count
     )
 
+# ==============================
+# メイン追跡関数（Smart Death統合版）
+# ==============================
+
 @partial(jit, static_argnums=(7,))
-def track_vortices_step_complete(
-    particle_state,  # ParticleState from main simulation
+def track_vortices_step_smart(
+    particle_state,
     vortex_state: VortexStateJAX,
     membership: ParticleMembershipJAX,
     shedding_stats: VortexSheddingStats,
     step: int,
     next_id: int,
     obstacle_center: jnp.ndarray,
-    config  # GETWindConfig (static)
+    config
 ) -> Tuple[VortexStateJAX, ParticleMembershipJAX, VortexSheddingStats, int, Dict]:
-    """完全JIT対応版の渦追跡ステップ"""
+    """完全JIT対応 + 賢い死判定版の渦追跡ステップ"""
     
     # 上側検出
     upper_centers, upper_props, upper_particle_ids = detect_vortex_clusters_separated(
@@ -587,6 +762,11 @@ def track_vortices_step_complete(
     # 結合
     centers = jnp.concatenate([upper_centers, lower_centers], axis=0)
     properties = jnp.concatenate([upper_props, lower_props], axis=0)
+    particle_cluster_ids = jnp.where(
+        upper_particle_ids >= 0,
+        upper_particle_ids,
+        jnp.where(lower_particle_ids >= 0, lower_particle_ids + len(upper_centers), -1)
+    )
     
     # マッチング
     matches, is_matched = match_vortices_vectorized(
@@ -619,17 +799,22 @@ def track_vortices_step_complete(
         step
     )
     
-    # 渦状態の更新（完全版）
-    vortex_state_updated, next_id = update_vortex_state(
+    # 🆕 賢い死判定を含む渦状態の更新
+    vortex_state_updated, next_id, death_diagnostics = update_vortex_state_smart(
         vortex_state,
         matches,
         centers,
         properties,
+        sides_array,
+        particle_state.Lambda_F,
+        particle_state.position,
+        particle_cluster_ids,
         step,
-        next_id
+        next_id,
+        death_threshold=0.2
     )
     
-    # 統計計算（完全JIT対応）
+    # 統計計算
     n_active = jnp.sum(vortex_state_updated.is_alive)
     n_total = jnp.sum(vortex_state_updated.ids > 0)
     
@@ -640,7 +825,6 @@ def track_vortices_step_complete(
         config.Lambda_F_inlet
     )
     
-    # 平均値計算
     active_mask = vortex_state_updated.is_alive
     active_circulations = jnp.where(active_mask, vortex_state_updated.circulations, 0)
     active_coherences = jnp.where(active_mask, vortex_state_updated.coherences, 0)
@@ -656,282 +840,28 @@ def track_vortices_step_complete(
         'strouhal_number': St,
         'mean_circulation': mean_circulation,
         'mean_coherence': mean_coherence,
-        'particle_exchange_rate': 0.0
+        'mean_health': death_diagnostics['mean_health'],
+        'n_deaths': death_diagnostics['n_deaths']
     }
     
     return vortex_state_updated, membership, shedding_stats, next_id, metrics
 
-
 # ==============================
-# 補助関数：剥離頻度の計算（JIT対応）
-# ==============================
-
-@jit
-def compute_shedding_frequency(
-    stats: 'VortexSheddingStats',
-    dt: float,
-    window_size: int = 10
-) -> tuple:
-    """
-    剥離頻度の計算（最近のN個のイベントから）
-    
-    Returns:
-    --------
-    tuple : (upper_frequency, lower_frequency, mean_frequency)
-    """
-    
-    # 上側の頻度計算
-    upper_valid_count = jnp.minimum(stats.upper_count, window_size)
-    
-    def compute_upper_freq():
-        # 最新のwindow_size個のインデックスを計算
-        start_idx = jnp.maximum(0, stats.upper_count - window_size)
-        
-        # 循環バッファから有効な値を取得
-        indices = jnp.arange(window_size)
-        actual_indices = (start_idx + indices) % stats.upper_shedding_steps.shape[0]
-        
-        steps = stats.upper_shedding_steps[actual_indices]
-        
-        # 間隔を計算（有効な値のみ）
-        valid_mask = steps >= 0
-        valid_steps = jnp.where(valid_mask, steps, 0)
-        
-        # 差分を計算
-        diffs = jnp.diff(valid_steps)
-        valid_diffs = jnp.where(diffs > 0, diffs, 0)
-        
-        mean_interval = jnp.sum(valid_diffs) / jnp.maximum(jnp.sum(valid_diffs > 0), 1)
-        frequency = 1.0 / (mean_interval * dt + 1e-8)
-        
-        return jnp.where(upper_valid_count >= 2, frequency, 0.0)
-    
-    upper_freq = compute_upper_freq()
-    
-    # 下側の頻度計算（同様の処理）
-    lower_valid_count = jnp.minimum(stats.lower_count, window_size)
-    
-    def compute_lower_freq():
-        start_idx = jnp.maximum(0, stats.lower_count - window_size)
-        indices = jnp.arange(window_size)
-        actual_indices = (start_idx + indices) % stats.lower_shedding_steps.shape[0]
-        
-        steps = stats.lower_shedding_steps[actual_indices]
-        valid_mask = steps >= 0
-        valid_steps = jnp.where(valid_mask, steps, 0)
-        
-        diffs = jnp.diff(valid_steps)
-        valid_diffs = jnp.where(diffs > 0, diffs, 0)
-        
-        mean_interval = jnp.sum(valid_diffs) / jnp.maximum(jnp.sum(valid_diffs > 0), 1)
-        frequency = 1.0 / (mean_interval * dt + 1e-8)
-        
-        return jnp.where(lower_valid_count >= 2, frequency, 0.0)
-    
-    lower_freq = compute_lower_freq()
-    
-    # 平均頻度
-    has_both = (upper_freq > 0) & (lower_freq > 0)
-    mean_freq = jnp.where(
-        has_both,
-        (upper_freq + lower_freq) / 2.0,
-        jnp.where(
-            upper_freq > 0,
-            upper_freq,
-            lower_freq
-        )
-    )
-    
-    return upper_freq, lower_freq, mean_freq
-
-
-# ==============================
-# 渦剥離パターンの解析（JIT対応）
+# 補助関数
 # ==============================
 
-@jit
-def analyze_shedding_pattern(
-    stats: 'VortexSheddingStats',
-    window_size: int = 20
-) -> dict:
-    """
-    渦剥離パターンの統計解析
-    
-    Returns:
-    --------
-    dict : パターン解析結果
-    """
-    
-    # 最近のwindow_size個のイベントを取得
-    def get_recent_events(steps, count):
-        # 循環バッファから最新のイベントを取得
-        n_valid = jnp.minimum(count, window_size)
-        start_idx = jnp.maximum(0, count - window_size)
-        
-        indices = jnp.arange(window_size)
-        actual_indices = (start_idx + indices) % steps.shape[0]
-        
-        recent_steps = steps[actual_indices]
-        valid_mask = (indices < n_valid) & (recent_steps >= 0)
-        
-        return recent_steps, valid_mask
-    
-    upper_recent, upper_mask = get_recent_events(
-        stats.upper_shedding_steps, stats.upper_count
-    )
-    lower_recent, lower_mask = get_recent_events(
-        stats.lower_shedding_steps, stats.lower_count
-    )
-    
-    # 交互パターンの検出（上下が交互に剥離しているか）
-    def check_alternating():
-        # 両方のイベントを時系列順に並べる
-        all_steps = jnp.concatenate([
-            jnp.where(upper_mask, upper_recent, -1),
-            jnp.where(lower_mask, lower_recent, -1)
-        ])
-        all_sides = jnp.concatenate([
-            jnp.zeros(window_size),  # upper = 0
-            jnp.ones(window_size)    # lower = 1
-        ])
-        
-        # ソート（-1は最後に来る）
-        sorted_indices = jnp.argsort(all_steps)
-        sorted_steps = all_steps[sorted_indices]
-        sorted_sides = all_sides[sorted_indices]
-        
-        # 有効なイベントのみを考慮
-        valid = sorted_steps >= 0
-        n_valid = jnp.sum(valid)
-        
-        # 連続する同じ側のイベントをカウント
-        side_changes = jnp.diff(sorted_sides)
-        alternating_count = jnp.sum(
-            jnp.where(valid[:-1] & valid[1:], jnp.abs(side_changes) > 0.5, False)
-        )
-        
-        alternating_ratio = alternating_count / jnp.maximum(n_valid - 1, 1)
-        
-        return alternating_ratio
-    
-    alternating_ratio = check_alternating()
-    
-    # 規則性の評価（間隔の標準偏差）
-    def compute_regularity(steps, mask):
-        valid_steps = jnp.where(mask, steps, 0)
-        n_valid = jnp.sum(mask)
-        
-        # 間隔を計算
-        intervals = jnp.diff(valid_steps)
-        valid_intervals = jnp.where(intervals > 0, intervals, 0)
-        n_intervals = jnp.sum(valid_intervals > 0)
-        
-        mean_interval = jnp.sum(valid_intervals) / jnp.maximum(n_intervals, 1)
-        variance = jnp.sum(
-            jnp.where(valid_intervals > 0, (valid_intervals - mean_interval)**2, 0)
-        ) / jnp.maximum(n_intervals, 1)
-        
-        std_interval = jnp.sqrt(variance)
-        regularity = jnp.exp(-std_interval / (mean_interval + 1e-8))
-        
-        return jnp.where(n_intervals >= 2, regularity, 0.0)
-    
-    upper_regularity = compute_regularity(upper_recent, upper_mask)
-    lower_regularity = compute_regularity(lower_recent, lower_mask)
-    
-    return {
-        'alternating_ratio': alternating_ratio,
-        'upper_regularity': upper_regularity,
-        'lower_regularity': lower_regularity,
-        'overall_regularity': (upper_regularity + lower_regularity) / 2.0,
-        'is_karman_like': (alternating_ratio > 0.7) & 
-                         (upper_regularity > 0.5) & 
-                         (lower_regularity > 0.5)
-    }
-
-# ==============================
-# 分析関数（JIT非対応だけど使える）
-# ==============================
-def print_vortex_events(vortex_state: VortexStateJAX, 
-                        prev_state: VortexStateJAX, 
-                        step: int):
-    """渦の誕生・消滅イベントを出力"""
-    # NumPyに変換
-    curr_alive = np.array(vortex_state.is_alive)
-    prev_alive = np.array(prev_state.is_alive)
-    
-    # 新規誕生
-    new_born = (~prev_alive) & curr_alive
-    if np.any(new_born):
-        born_indices = np.where(new_born)[0]
-        for idx in born_indices[:3]:  # 最初の3個だけ表示
-            side = "upper" if vortex_state.birth_side[idx] == 0 else "lower"
-            print(f"  ★ BIRTH: Vortex ({side}) at step {step}")
-
-def create_vortex_genealogy_jax(vortex_state: VortexStateJAX) -> str:
-    """渦の系譜図を作成"""
-    output = "=== Vortex Genealogy ===\n"
-    
-    # NumPyに変換
-    ids = np.array(vortex_state.ids)
-    is_alive = np.array(vortex_state.is_alive)
-    birth_steps = np.array(vortex_state.birth_steps)
-    death_steps = np.array(vortex_state.death_steps)
-    birth_side = np.array(vortex_state.birth_side)
-    
-    # 有効な渦のみ処理（最初の10個）
-    valid_vortices = ids > 0
-    for i in np.where(valid_vortices)[0][:10]:
-        side = "upper" if birth_side[i] == 0 else "lower"
-        status = "alive" if is_alive[i] else f"died@{death_steps[i]}"
-        output += f"ID {ids[i]:3d} | {side:5s} | born@{birth_steps[i]:5d} | {status}\n"
-    
-    return output
-
-def analyze_particle_fates_jax(membership: ParticleMembershipJAX) -> Dict:
-    """粒子の運命統計"""
-    history_count = np.array(membership.history_count)
-    current_vortex = np.array(membership.vortex_ids)
-    
-    return {
-        'never_vortex': int(np.sum(history_count == 0)),
-        'single_vortex': int(np.sum(history_count == 1)),
-        'multiple_vortices': int(np.sum(history_count > 1)),
-        'currently_in_vortex': int(np.sum(current_vortex > 0)),
-        'mean_vortices_per_particle': float(np.mean(history_count))
-    }
-
-def analyze_vortex_statistics_jax(vortex_state: VortexStateJAX) -> Dict:
-    """渦統計解析"""
-    is_alive = np.array(vortex_state.is_alive)
-    birth_steps = np.array(vortex_state.birth_steps)
-    death_steps = np.array(vortex_state.death_steps)
-    
-    completed = (birth_steps >= 0) & (death_steps >= 0)
-    
-    if np.sum(completed) > 0:
-        lifetimes = death_steps[completed] - birth_steps[completed]
-        stats = {
-            'n_completed': int(np.sum(completed)),
-            'n_active': int(np.sum(is_alive)),
-            'mean_lifetime': float(np.mean(lifetimes)),
-            'std_lifetime': float(np.std(lifetimes)),
-            'mean_travel_distance': 0.0,
-            'max_lifetime': int(np.max(lifetimes)),
-            'min_lifetime': int(np.min(lifetimes))
-        }
+def explain_death_reason(health_score: float, threshold: float = 0.2) -> str:
+    """健康スコアから死因を説明"""
+    if health_score >= threshold:
+        return "Alive and healthy"
+    elif health_score < 0.05:
+        return "Critical weakness - total collapse"
+    elif health_score < 0.1:
+        return "Severe deterioration"
+    elif health_score < 0.15:
+        return "Lost structural integrity"
     else:
-        stats = {
-            'n_completed': 0,
-            'n_active': int(np.sum(is_alive)),
-            'mean_lifetime': 0.0,
-            'std_lifetime': 0.0,
-            'mean_travel_distance': 0.0,
-            'max_lifetime': 0,
-            'min_lifetime': 0
-        }
-    
-    return stats
+        return "Below health threshold"
 
 # ==============================
 # テスト用
@@ -939,25 +869,23 @@ def analyze_vortex_statistics_jax(vortex_state: VortexStateJAX) -> Dict:
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("GET Wind™ v6.3 JAX - FULLY JIT-Compatible Version!")
-    print("環ちゃん & ご主人さま Ultimate Achievement! 💕")
+    print("GET Wind™ v6.3 JAX - FULLY JIT + Smart Death Edition!")
+    print("環ちゃん & ご主人さま Ultimate Intelligence! 💕")
     print("=" * 70)
     
-    print("\n✨ Key Features (COMPLETE VERSION):")
-    print("  ✅ NO Boolean Indexing - 完全排除!")
-    print("  ✅ Fixed-size arrays only - 固定サイズ配列のみ!")
+    print("\n✨ Merged Features:")
     print("  ✅ Full JIT compilation - 完全JIT対応!")
-    print("  ✅ New vortex creation - 新規渦追加完全実装!")
-    print("  ✅ Existing vortex update - 既存渦更新完全実装!")
-    print("  ✅ Shedding statistics - 剥離統計正しくカウント!")
-    print("  ✅ Strouhal calculation - St数計算も完全対応!")
-    print("  ✅ Birth side tracking - 上下識別も完全対応!")
-    print("  ✅ 100x speedup expected - 100倍高速化!")
+    print("  ✅ NO Boolean Indexing - 完全排除!")
+    print("  ✅ Smart health monitoring - 賢い健康監視!")
+    print("  ✅ Phase-lag aware sync - 位相ラグ考慮!")
+    print("  ✅ Temporal stability - 時間的安定性!")
+    print("  ✅ Physically justified death - 物理的に正しい死!")
     
-    print("\n🎉 Ready for use in main simulation!")
-    print("   Just import and use track_vortices_step_complete()")
+    print("\n🎯 Integration Complete:")
+    print("  • Original JIT-compatible tracking ✓")
+    print("  • Smart death judgment system ✓")
+    print("  • Full vortex lifecycle management ✓")
     
-    # 簡単なテスト
     vortex_state = initialize_vortex_state()
     membership = initialize_particle_membership(1500)
     shedding_stats = initialize_shedding_stats()
@@ -967,4 +895,5 @@ if __name__ == "__main__":
     print(f"  Membership: {membership.vortex_ids.shape[0]} max particles")
     print(f"  Shedding stats: {shedding_stats.upper_shedding_steps.shape[0]} max events")
     
-    print("\n✨ COMPLETE! Boolean Indexing is DEAD! Long live JIT! ✨")
+    print("\n✨ Ready for simulation! Use track_vortices_step_smart() ✨")
+    print("=" * 70)
