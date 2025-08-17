@@ -272,7 +272,7 @@ def smart_vortex_death_judgment(
     particle_vortex_ids: jnp.ndarray,  # 各粒子の所属渦ID
     step: int,
     history_window: int = 10,      # static_argnums=6
-    death_threshold: float = 0.2   # static_argnums=7
+    death_threshold: float = 0.08   # static_argnums=7
 ) -> tuple:
     """
     環ちゃんの賢い渦死判定！
