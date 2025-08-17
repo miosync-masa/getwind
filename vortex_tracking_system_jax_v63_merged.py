@@ -100,7 +100,7 @@ def initialize_vortex_state(max_vortices: int = 100,
 # 渦の健康状態評価（Smart Death System）
 # ==============================
 
-@jit
+@partial(jit, static_argnums=(6,))  # history_lenを静的に
 def compute_vortex_health(
     coherence: float,
     circulation: float,
@@ -108,7 +108,7 @@ def compute_vortex_health(
     coherence_history: jnp.ndarray,  # 最近のcoherence履歴
     circulation_history: jnp.ndarray,  # 最近のcirculation履歴
     particle_history: jnp.ndarray,    # 最近の粒子数履歴
-    history_len: int = 10
+    history_len: int = 10  # static_argnums=6
 ) -> dict:
     """
     渦の健康状態を総合的に評価
@@ -211,13 +211,13 @@ def compute_vortex_health(
 # 位相ラグを考慮した同期評価
 # ==============================
 
-@jit
+@partial(jit, static_argnums=(4,))  # max_lagを静的に
 def evaluate_phase_lag_sync(
     Lambda_F: jnp.ndarray,          # 粒子のΛF (N, 2)
     positions: jnp.ndarray,         # 粒子の位置 (N, 2)
     vortex_center: jnp.ndarray,     # 渦中心 (2,)
     mask: jnp.ndarray,              # 有効粒子マスク (N,)
-    max_lag: float = 0.2            # 最大許容位相ラグ（時間単位）
+    max_lag: float = 0.2            # static_argnums=4 最大許容位相ラグ（時間単位）
 ) -> float:
     """
     位相ラグを考慮したΛF同期の評価
@@ -263,7 +263,7 @@ def evaluate_phase_lag_sync(
 # 賢い死の判定（環ちゃんレベル！）
 # ==============================
 
-@jit
+@partial(jit, static_argnums=(6, 7))  # history_windowとdeath_thresholdを静的に
 def smart_vortex_death_judgment(
     vortex_state: VortexStateJAX,
     idx: int,
@@ -271,8 +271,8 @@ def smart_vortex_death_judgment(
     positions: jnp.ndarray,        # 全粒子の位置
     particle_vortex_ids: jnp.ndarray,  # 各粒子の所属渦ID
     step: int,
-    history_window: int = 10,
-    death_threshold: float = 0.2   # 健康度がこれ以下なら死
+    history_window: int = 10,      # static_argnums=6
+    death_threshold: float = 0.2   # static_argnums=7
 ) -> tuple:
     """
     環ちゃんの賢い渦死判定！
@@ -322,8 +322,8 @@ def smart_vortex_death_judgment(
     # === 1. 基本的な健康状態評価 ===
     health = compute_vortex_health(
         coherence, circulation, n_particles,
-        coherence_history, circulation_history, particle_history,
-        history_window
+        coherence_history, circulation_history, particle_history
+        # history_len=history_windowはデフォルト値を使用
     )
     
     # === 2. 位相ラグ同期の評価 ===
@@ -331,7 +331,8 @@ def smart_vortex_death_judgment(
     particle_mask = particle_vortex_ids == vortex_state.ids[idx]
     
     phase_sync = evaluate_phase_lag_sync(
-        Lambda_F, positions, vortex_center, particle_mask, max_lag=0.2
+        Lambda_F, positions, vortex_center, particle_mask
+        # max_lag=0.2はデフォルト値を使用
     )
     
     # === 3. 構造テンソルの一貫性（追加評価）===
@@ -529,7 +530,7 @@ def match_vortices_vectorized(
 # 渦状態更新（賢い死判定統合版 - 完全実装）
 # ==============================
 
-@jit
+@partial(jit, static_argnums=(10,))  # death_thresholdを静的に
 def update_vortex_state_with_smart_death(
     vortex_state: VortexStateJAX,
     matches: jnp.ndarray,
@@ -541,7 +542,7 @@ def update_vortex_state_with_smart_death(
     particle_vortex_ids: jnp.ndarray,  # 追加：粒子の所属
     step: int,
     next_id: int,
-    death_threshold: float = 0.2
+    death_threshold: float = 0.2  # static_argnums=10
 ) -> tuple:
     """
     賢い死の判定を組み込んだ渦状態更新（完全版）
@@ -660,7 +661,8 @@ def update_vortex_state_with_smart_death(
             ),
             i,
             Lambda_F, positions, particle_vortex_ids,
-            step, history_window=10, death_threshold=death_threshold
+            step
+            # history_window=10, death_threshold=death_thresholdはデフォルト値を使用
         )
         return should_die, health_score, death_reason
     
@@ -987,8 +989,8 @@ def track_vortices_step_smart(
         particle_state.position,  # 追加
         particle_vortex_ids,      # 追加
         step,
-        next_id,
-        death_threshold=0.2
+        next_id
+        # death_threshold=0.2はデフォルト値を使用
     )
     
     # 統計計算
