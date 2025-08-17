@@ -219,16 +219,18 @@ def smart_vortex_death_judgment_simple(
     
     # 新生児は絶対殺さない！
     def check_death():
-        # 粒子数チェック
-        if n_particles < 3:
-            return True, 0.0, 2  # 構造崩壊
+        # JAX互換のチェック（if文使わない！）
+        particle_death = n_particles < 3
+        coherence_death = coherence < death_threshold
         
-        # ΛF同期チェック（これが本質！）
-        if coherence < death_threshold:
-            return True, coherence, 1  # ΛF同期喪失
+        should_die = particle_death | coherence_death
+        death_reason = jnp.where(
+            particle_death, 2,  # 構造崩壊
+            jnp.where(coherence_death, 1, 0)  # ΛF同期喪失 or 生存
+        )
+        health_score = jnp.where(should_die, 0.0, coherence)
         
-        # 生きてる！
-        return False, coherence, 0
+        return should_die, health_score, death_reason
     
     should_die, health_score, death_reason = lax.cond(
         is_alive & ~is_newborn,  # 生きてて新生児じゃない場合のみ
