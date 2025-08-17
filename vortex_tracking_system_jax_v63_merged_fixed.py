@@ -249,7 +249,6 @@ def smart_vortex_death_judgment_simple(
 # ==============================
 # 🔧 修正版：緩い渦検出
 # ==============================
-
 @partial(jit, static_argnums=(5, 6, 7))
 def detect_vortex_clusters_separated(
     positions: jnp.ndarray,
@@ -257,7 +256,7 @@ def detect_vortex_clusters_separated(
     Q_criterion: jnp.ndarray,
     active_mask: jnp.ndarray,
     obstacle_center: jnp.ndarray,
-    side: int,  # 0=upper, 1=lower
+    side: int,  # 0=upper, 1=lower （互換性のため残すけど使わない）
     grid_size: int = 10,
     min_particles: int = 3  # 3個から渦認定！
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -265,21 +264,8 @@ def detect_vortex_clusters_separated(
     N = positions.shape[0]
     max_clusters = 25
     
-    # Y方向のオフセット
-    y_offset = jnp.where(side == 0, 20.0, -20.0)
-    y_center = obstacle_center[1] + y_offset
-    
-    # 対象領域のマスク
-    y_min = jnp.where(side == 0, y_center - 10, y_center - 30)
-    y_max = jnp.where(side == 0, y_center + 30, y_center + 10)
-    
-    # 🔧 Q_criterion閾値を大幅に緩和！
-    region_mask = (
-        active_mask & 
-        (Q_criterion > 0.1) &  # 0.5 → 0.1に！
-        (positions[:, 1] >= y_min) &
-        (positions[:, 1] <= y_max)
-    )
+    # 🔧 全領域で検出！（ここ追加！）
+    region_mask = active_mask & (Q_criterion > 0.1)
     
     # グリッド化
     grid_scale = 20.0
@@ -308,15 +294,27 @@ def detect_vortex_clusters_separated(
             0.0
         )
         
-        # 循環（簡易計算）
+        # 循環（物理的に正しい版）
         rel_pos = positions - center[None, :]
-        cross_z = rel_pos[:, 0] * Lambda_F[:, 1] - rel_pos[:, 1] * Lambda_F[:, 0]
+        distances = jnp.linalg.norm(rel_pos, axis=1) + 1e-8
+        
+        # 接線ベクトル（反時計回り）
+        tangent = jnp.stack([-rel_pos[:, 1], rel_pos[:, 0]], axis=1)
+        tangent = tangent / distances[:, None]
+        
+        # v·t （速度と接線の内積）
+        v_tangential = jnp.sum(Lambda_F * tangent, axis=1)
+        
+        # 距離で重み付け（近い粒子を重視）
+        weights = jnp.exp(-distances / 10.0)
+        
         circulation = jnp.where(
             valid,
-            jnp.sum(jnp.where(cell_mask, cross_z, 0)) / jnp.maximum(n_particles, 1),
+            jnp.sum(jnp.where(cell_mask, v_tangential * weights, 0)) / 
+            jnp.maximum(jnp.sum(jnp.where(cell_mask, weights, 0)), 1e-8),
             0.0
         )
-        
+                
         return center, jnp.array([circulation, coherence, n_particles.astype(jnp.float32)])
     
     unique_grid_ids = jnp.unique(grid_ids, size=max_clusters, fill_value=-1)
