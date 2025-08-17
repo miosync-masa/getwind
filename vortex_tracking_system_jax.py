@@ -466,6 +466,88 @@ def update_vortex_state(
 # ==============================
 # メイン追跡関数（完全JIT対応版）
 # ==============================
+@jit
+def update_shedding_stats(
+    stats: 'VortexSheddingStats',  # 型ヒントは文字列で
+    has_new_upper: bool,
+    has_new_lower: bool,
+    step: int
+) -> 'VortexSheddingStats':
+    """
+    剥離統計の更新（Boolean Indexing完全排除版）
+    
+    Parameters:
+    -----------
+    stats : VortexSheddingStats
+        現在の剥離統計
+    has_new_upper : bool
+        上側に新規渦が発生したか
+    has_new_lower : bool
+        下側に新規渦が発生したか
+    step : int
+        現在のステップ数
+        
+    Returns:
+    --------
+    VortexSheddingStats
+        更新された剥離統計
+    """
+    
+    # 上側の更新
+    new_upper_count = lax.cond(
+        has_new_upper,
+        lambda x: x + 1,
+        lambda x: x,
+        stats.upper_count
+    )
+    
+    # 上側のステップ配列を更新（Boolean indexingを避ける）
+    def update_upper_steps(carry):
+        steps, count = carry
+        # 現在のカウントを配列インデックスとして使用（モジュロで循環）
+        idx = count % steps.shape[0]
+        
+        # has_new_upperがTrueの場合のみ更新
+        new_steps = lax.cond(
+            has_new_upper,
+            lambda s: s.at[idx].set(step),
+            lambda s: s,
+            steps
+        )
+        return new_steps
+    
+    new_upper_steps = update_upper_steps((stats.upper_shedding_steps, stats.upper_count))
+    
+    # 下側の更新
+    new_lower_count = lax.cond(
+        has_new_lower,
+        lambda x: x + 1,
+        lambda x: x,
+        stats.lower_count
+    )
+    
+    # 下側のステップ配列を更新
+    def update_lower_steps(carry):
+        steps, count = carry
+        idx = count % steps.shape[0]
+        
+        new_steps = lax.cond(
+            has_new_lower,
+            lambda s: s.at[idx].set(step),
+            lambda s: s,
+            steps
+        )
+        return new_steps
+    
+    new_lower_steps = update_lower_steps((stats.lower_shedding_steps, stats.lower_count))
+    
+    # 更新された統計を返す
+    return stats._replace(
+        upper_shedding_steps=new_upper_steps,
+        lower_shedding_steps=new_lower_steps,
+        upper_count=new_upper_count,
+        lower_count=new_lower_count
+    )
 
 @partial(jit, static_argnums=(7,))
 def track_vortices_step_complete(
@@ -579,10 +661,197 @@ def track_vortices_step_complete(
     
     return vortex_state_updated, membership, shedding_stats, next_id, metrics
 
+
+# ==============================
+# 補助関数：剥離頻度の計算（JIT対応）
+# ==============================
+
+@jit
+def compute_shedding_frequency(
+    stats: 'VortexSheddingStats',
+    dt: float,
+    window_size: int = 10
+) -> tuple:
+    """
+    剥離頻度の計算（最近のN個のイベントから）
+    
+    Returns:
+    --------
+    tuple : (upper_frequency, lower_frequency, mean_frequency)
+    """
+    
+    # 上側の頻度計算
+    upper_valid_count = jnp.minimum(stats.upper_count, window_size)
+    
+    def compute_upper_freq():
+        # 最新のwindow_size個のインデックスを計算
+        start_idx = jnp.maximum(0, stats.upper_count - window_size)
+        
+        # 循環バッファから有効な値を取得
+        indices = jnp.arange(window_size)
+        actual_indices = (start_idx + indices) % stats.upper_shedding_steps.shape[0]
+        
+        steps = stats.upper_shedding_steps[actual_indices]
+        
+        # 間隔を計算（有効な値のみ）
+        valid_mask = steps >= 0
+        valid_steps = jnp.where(valid_mask, steps, 0)
+        
+        # 差分を計算
+        diffs = jnp.diff(valid_steps)
+        valid_diffs = jnp.where(diffs > 0, diffs, 0)
+        
+        mean_interval = jnp.sum(valid_diffs) / jnp.maximum(jnp.sum(valid_diffs > 0), 1)
+        frequency = 1.0 / (mean_interval * dt + 1e-8)
+        
+        return jnp.where(upper_valid_count >= 2, frequency, 0.0)
+    
+    upper_freq = compute_upper_freq()
+    
+    # 下側の頻度計算（同様の処理）
+    lower_valid_count = jnp.minimum(stats.lower_count, window_size)
+    
+    def compute_lower_freq():
+        start_idx = jnp.maximum(0, stats.lower_count - window_size)
+        indices = jnp.arange(window_size)
+        actual_indices = (start_idx + indices) % stats.lower_shedding_steps.shape[0]
+        
+        steps = stats.lower_shedding_steps[actual_indices]
+        valid_mask = steps >= 0
+        valid_steps = jnp.where(valid_mask, steps, 0)
+        
+        diffs = jnp.diff(valid_steps)
+        valid_diffs = jnp.where(diffs > 0, diffs, 0)
+        
+        mean_interval = jnp.sum(valid_diffs) / jnp.maximum(jnp.sum(valid_diffs > 0), 1)
+        frequency = 1.0 / (mean_interval * dt + 1e-8)
+        
+        return jnp.where(lower_valid_count >= 2, frequency, 0.0)
+    
+    lower_freq = compute_lower_freq()
+    
+    # 平均頻度
+    has_both = (upper_freq > 0) & (lower_freq > 0)
+    mean_freq = jnp.where(
+        has_both,
+        (upper_freq + lower_freq) / 2.0,
+        jnp.where(
+            upper_freq > 0,
+            upper_freq,
+            lower_freq
+        )
+    )
+    
+    return upper_freq, lower_freq, mean_freq
+
+
+# ==============================
+# 渦剥離パターンの解析（JIT対応）
+# ==============================
+
+@jit
+def analyze_shedding_pattern(
+    stats: 'VortexSheddingStats',
+    window_size: int = 20
+) -> dict:
+    """
+    渦剥離パターンの統計解析
+    
+    Returns:
+    --------
+    dict : パターン解析結果
+    """
+    
+    # 最近のwindow_size個のイベントを取得
+    def get_recent_events(steps, count):
+        # 循環バッファから最新のイベントを取得
+        n_valid = jnp.minimum(count, window_size)
+        start_idx = jnp.maximum(0, count - window_size)
+        
+        indices = jnp.arange(window_size)
+        actual_indices = (start_idx + indices) % steps.shape[0]
+        
+        recent_steps = steps[actual_indices]
+        valid_mask = (indices < n_valid) & (recent_steps >= 0)
+        
+        return recent_steps, valid_mask
+    
+    upper_recent, upper_mask = get_recent_events(
+        stats.upper_shedding_steps, stats.upper_count
+    )
+    lower_recent, lower_mask = get_recent_events(
+        stats.lower_shedding_steps, stats.lower_count
+    )
+    
+    # 交互パターンの検出（上下が交互に剥離しているか）
+    def check_alternating():
+        # 両方のイベントを時系列順に並べる
+        all_steps = jnp.concatenate([
+            jnp.where(upper_mask, upper_recent, -1),
+            jnp.where(lower_mask, lower_recent, -1)
+        ])
+        all_sides = jnp.concatenate([
+            jnp.zeros(window_size),  # upper = 0
+            jnp.ones(window_size)    # lower = 1
+        ])
+        
+        # ソート（-1は最後に来る）
+        sorted_indices = jnp.argsort(all_steps)
+        sorted_steps = all_steps[sorted_indices]
+        sorted_sides = all_sides[sorted_indices]
+        
+        # 有効なイベントのみを考慮
+        valid = sorted_steps >= 0
+        n_valid = jnp.sum(valid)
+        
+        # 連続する同じ側のイベントをカウント
+        side_changes = jnp.diff(sorted_sides)
+        alternating_count = jnp.sum(
+            jnp.where(valid[:-1] & valid[1:], jnp.abs(side_changes) > 0.5, False)
+        )
+        
+        alternating_ratio = alternating_count / jnp.maximum(n_valid - 1, 1)
+        
+        return alternating_ratio
+    
+    alternating_ratio = check_alternating()
+    
+    # 規則性の評価（間隔の標準偏差）
+    def compute_regularity(steps, mask):
+        valid_steps = jnp.where(mask, steps, 0)
+        n_valid = jnp.sum(mask)
+        
+        # 間隔を計算
+        intervals = jnp.diff(valid_steps)
+        valid_intervals = jnp.where(intervals > 0, intervals, 0)
+        n_intervals = jnp.sum(valid_intervals > 0)
+        
+        mean_interval = jnp.sum(valid_intervals) / jnp.maximum(n_intervals, 1)
+        variance = jnp.sum(
+            jnp.where(valid_intervals > 0, (valid_intervals - mean_interval)**2, 0)
+        ) / jnp.maximum(n_intervals, 1)
+        
+        std_interval = jnp.sqrt(variance)
+        regularity = jnp.exp(-std_interval / (mean_interval + 1e-8))
+        
+        return jnp.where(n_intervals >= 2, regularity, 0.0)
+    
+    upper_regularity = compute_regularity(upper_recent, upper_mask)
+    lower_regularity = compute_regularity(lower_recent, lower_mask)
+    
+    return {
+        'alternating_ratio': alternating_ratio,
+        'upper_regularity': upper_regularity,
+        'lower_regularity': lower_regularity,
+        'overall_regularity': (upper_regularity + lower_regularity) / 2.0,
+        'is_karman_like': (alternating_ratio > 0.7) & 
+                         (upper_regularity > 0.5) & 
+                         (lower_regularity > 0.5)
+    }
+
 # ==============================
 # 分析関数（JIT非対応だけど使える）
 # ==============================
-
 def print_vortex_events(vortex_state: VortexStateJAX, 
                         prev_state: VortexStateJAX, 
                         step: int):
