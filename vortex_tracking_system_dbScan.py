@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GET Wind™ Vortex Tracking System - DBSCAN Edition
+GET Wind™ Vortex Tracking System - DBSCAN Edition (Fixed)
 環ちゃん & ご主人さま Super Simple Edition! 💕
 
-シンプル is ベスト！
-- DBSCANで渦検出
-- スナップショット記録
-- 後から解析
+修正版：
+- Strouhal数の計算修正
+- 強い渦のフィルタリング追加
+- より正確な周期検出
 """
 
 import numpy as np
@@ -104,7 +104,7 @@ def compute_circulation(
     rel_pos = positions - center
     distances = np.linalg.norm(rel_pos, axis=1) + 1e-8
     
-    # 接線ベクトル（反時計回り）
+    # 接線ベクトル（反時計回りを正とする基準）
     tangent = np.stack([-rel_pos[:, 1], rel_pos[:, 0]], axis=1)
     tangent = tangent / distances[:, None]
     
@@ -115,9 +115,32 @@ def compute_circulation(
     weights = np.exp(-distances / 10.0)
     
     # 重み付き平均
+    # circulation > 0: 反時計回り（CCW）
+    # circulation < 0: 時計回り（CW）
     circulation = np.sum(v_tangential * weights) / np.sum(weights)
     
     return circulation
+
+# ==============================
+# 渦のフィルタリング（新規追加！）
+# ==============================
+
+def filter_strong_vortices(
+    vortices: List[Vortex],
+    min_circulation: float = 0.5,
+    min_particles: int = 5,
+    x_max: float = 250.0  # 障害物から離れすぎた渦は除外
+) -> List[Vortex]:
+    """強い渦のみを抽出"""
+    
+    strong_vortices = []
+    for vortex in vortices:
+        if (abs(vortex.circulation) >= min_circulation and
+            vortex.n_particles >= min_particles and
+            vortex.center[0] <= x_max):
+            strong_vortices.append(vortex)
+    
+    return strong_vortices
 
 # ==============================
 # 軌跡追跡（フレーム間マッチング）
@@ -233,37 +256,137 @@ def compute_strouhal_number(
     tracks: Dict,
     obstacle_size: float,
     inlet_velocity: float,
-    dt: float
+    dt: float,
+    min_circulation: float = 0.5,
+    min_track_length: int = 5
 ) -> float:
-    """軌跡からStrouhal数を計算"""
+    """
+    Strouhal数を計算（修正版）
+    - 強い渦のみを対象
+    - 上下交互の剥離を考慮
+    """
     
-    # 上側の渦の生成時刻を抽出
-    upper_birth_times = []
+    # 強い渦の剥離時刻を収集
+    shedding_events = []  # (step, y_position, circulation)
     
     for vortex_id, track in tracks.items():
-        if track:
-            # 最初の位置で上下判定
-            first_y = track[0][1][1]
-            if first_y > 75:  # 上側
-                birth_step = track[0][0]
-                upper_birth_times.append(birth_step)
+        if len(track) < min_track_length:
+            continue
+            
+        # 最大循環をチェック
+        max_circulation = max(abs(t[2]) for t in track)
+        if max_circulation < min_circulation:
+            continue
+        
+        # 初期位置で上下判定
+        birth_step = track[0][0]
+        birth_y = track[0][1][1]
+        birth_circulation = track[0][2]
+        
+        # 強い渦の剥離イベントとして記録
+        shedding_events.append((birth_step, birth_y, birth_circulation))
     
-    if len(upper_birth_times) < 2:
+    if len(shedding_events) < 4:  # 最低4つは必要
         return 0.0
     
     # 時間順にソート
-    upper_birth_times.sort()
+    shedding_events.sort(key=lambda x: x[0])
     
-    # 間隔を計算
-    intervals = np.diff(upper_birth_times)
-    mean_interval = np.mean(intervals) * dt
+    # 方法1: 全体の剥離頻度（上下合わせて）
+    all_steps = [e[0] for e in shedding_events]
+    all_intervals = np.diff(all_steps)
     
-    # 周波数とStrouhal数
-    frequency = 1.0 / mean_interval
+    if len(all_intervals) > 0:
+        # カルマン渦列は上下交互なので、同じ側の渦の間隔は2倍
+        mean_interval = np.mean(all_intervals) * dt  # 全渦の平均間隔
+        frequency = 1.0 / (mean_interval * 2.0)  # 片側の周波数
+    else:
+        return 0.0
+    
+    # 方法2: 上側のみの周期（検証用）
+    upper_events = [e for e in shedding_events if e[1] > 75]
+    if len(upper_events) >= 2:
+        upper_steps = [e[0] for e in upper_events]
+        upper_intervals = np.diff(upper_steps)
+        if len(upper_intervals) > 0:
+            upper_period = np.mean(upper_intervals) * dt
+            upper_frequency = 1.0 / upper_period
+            
+            # デバッグ情報
+            print(f"  Debug: Upper frequency = {upper_frequency:.3f} Hz")
+            print(f"  Debug: All vortex frequency = {1.0/mean_interval:.3f} Hz")
+    
+    # Strouhal数
     D = 2 * obstacle_size
     St = frequency * D / inlet_velocity
     
     return St
+
+def compute_strouhal_number_filtered(
+    tracks: Dict,
+    obstacle_size: float,
+    inlet_velocity: float,
+    dt: float,
+    min_circulation: float = 1.0,  # より厳しい閾値
+    min_track_length: int = 10,
+    x_range: Tuple[float, float] = (80, 200)  # 障害物近傍のみ
+) -> float:
+    """
+    より厳密なフィルタリングでStrouhal数を計算
+    主要な渦（カルマン渦）のみを対象
+    """
+    
+    # カルマン渦候補を抽出
+    karman_vortices = []
+    
+    for vortex_id, track in tracks.items():
+        if len(track) < min_track_length:
+            continue
+        
+        # 軌跡の統計
+        max_circulation = max(abs(t[2]) for t in track)
+        mean_x = np.mean([t[1][0] for t in track])
+        
+        # カルマン渦の条件
+        if (max_circulation >= min_circulation and
+            x_range[0] <= mean_x <= x_range[1]):
+            
+            birth_step = track[0][0]
+            birth_y = track[0][1][1]
+            
+            # 上下どちらか記録
+            side = 'upper' if birth_y > 75 else 'lower'
+            karman_vortices.append({
+                'step': birth_step,
+                'side': side,
+                'circulation': max_circulation
+            })
+    
+    if len(karman_vortices) < 4:
+        return 0.0
+    
+    # 上下別に分離
+    upper_steps = [v['step'] for v in karman_vortices if v['side'] == 'upper']
+    lower_steps = [v['step'] for v in karman_vortices if v['side'] == 'lower']
+    
+    # より多い方を使用
+    if len(upper_steps) >= len(lower_steps) and len(upper_steps) >= 2:
+        intervals = np.diff(sorted(upper_steps))
+    elif len(lower_steps) >= 2:
+        intervals = np.diff(sorted(lower_steps))
+    else:
+        return 0.0
+    
+    if len(intervals) > 0:
+        mean_interval = np.mean(intervals) * dt
+        frequency = 1.0 / mean_interval
+        
+        D = 2 * obstacle_size
+        St = frequency * D / inlet_velocity
+        
+        return St
+    
+    return 0.0
 
 # ==============================
 # 可視化
@@ -308,7 +431,7 @@ def plot_vortex_timeline(snapshots: List[VortexSnapshot], tracker: VortexTracker
     # 上: 渦数の時間変化
     stats = analyze_snapshots(snapshots)
     ax = axes[0]
-    ax.plot(stats['steps'], stats['n_vortices'], 'k-', label='Total')
+    ax.plot(stats['steps'], stats['n_vortices'], 'k-', label='Total', alpha=0.5)
     ax.plot(stats['steps'], stats['upper_counts'], 'r-', label='Upper')
     ax.plot(stats['steps'], stats['lower_counts'], 'b-', label='Lower')
     ax.set_ylabel('Number of Vortices')
@@ -316,12 +439,18 @@ def plot_vortex_timeline(snapshots: List[VortexSnapshot], tracker: VortexTracker
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # 下: 渦の軌跡
+    # 下: 渦の軌跡（強い渦のみ）
     ax = axes[1]
     for vortex_id, track in tracker.tracks.items():
-        if len(track) > 3:  # 短い軌跡は除外
-            positions = np.array([t[1] for t in track])
-            ax.plot(positions[:, 0], positions[:, 1], alpha=0.5)
+        if len(track) > 5:  # 短い軌跡は除外
+            # 最大循環をチェック
+            max_circulation = max(abs(t[2]) for t in track)
+            if max_circulation > 0.5:  # 強い渦のみ表示
+                positions = np.array([t[1] for t in track])
+                # 上下で色分け
+                color = 'red' if positions[0, 1] > 75 else 'blue'
+                ax.plot(positions[:, 0], positions[:, 1], 
+                       color=color, alpha=0.6, linewidth=1.5)
     
     # 障害物
     circle = plt.Circle((100, 75), 20, fill=False, color='black', linewidth=2)
@@ -330,7 +459,7 @@ def plot_vortex_timeline(snapshots: List[VortexSnapshot], tracker: VortexTracker
     ax.set_xlim(0, 300)
     ax.set_ylim(0, 150)
     ax.set_aspect('equal')
-    ax.set_title('Vortex Trajectories')
+    ax.set_title('Vortex Trajectories (Strong Vortices Only)')
     
     plt.tight_layout()
     return fig
@@ -380,8 +509,15 @@ def process_simulation_data(
         # 軌跡更新
         tracker.update(snapshot)
     
-    # Strouhal数計算
-    St = compute_strouhal_number(
+    # Strouhal数計算（両方の方法で）
+    St_basic = compute_strouhal_number(
+        tracker.tracks,
+        config.obstacle_size,
+        config.Lambda_F_inlet,
+        config.dt
+    )
+    
+    St_filtered = compute_strouhal_number_filtered(
         tracker.tracks,
         config.obstacle_size,
         config.Lambda_F_inlet,
@@ -391,14 +527,16 @@ def process_simulation_data(
     print(f"\n✨ Analysis Complete!")
     print(f"Total snapshots: {len(snapshots)}")
     print(f"Total vortices tracked: {tracker.next_id}")
-    print(f"Strouhal number: {St:.4f}")
+    print(f"Strouhal number (basic): {St_basic:.4f}")
+    print(f"Strouhal number (filtered): {St_filtered:.4f}")
     
     # 保存
     np.savez(save_file,
         n_steps=len(snapshots),
         steps=[s.step for s in snapshots],
         n_vortices=[len(s.vortices) for s in snapshots],
-        strouhal_number=St,
+        strouhal_number=St_basic,
+        strouhal_number_filtered=St_filtered,
         tracks=tracker.tracks
     )
     
@@ -411,10 +549,11 @@ def process_simulation_data(
 # ==============================
 
 if __name__ == "__main__":
-    print("✨ GET Wind™ Vortex Tracking - DBSCAN Edition ✨")
+    print("✨ GET Wind™ Vortex Tracking - DBSCAN Edition (Fixed) ✨")
     print("環ちゃん & ご主人さま Super Simple! 💕")
     print("\nFeatures:")
     print("  • DBSCAN clustering for vortex detection")
-    print("  • Simple snapshot-based tracking")
-    print("  • Automatic Strouhal number calculation")
-    print("  • < 500 lines of code!")
+    print("  • Fixed Strouhal number calculation")
+    print("  • Strong vortex filtering")
+    print("  • Automatic period detection")
+    print("  • < 600 lines of code!")
