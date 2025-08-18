@@ -268,7 +268,7 @@ def detect_vortex_clusters_separated(
     region_mask = active_mask & (Q_criterion > 0.1)
     
     # グリッド化
-    grid_scale = 20.0
+    grid_scale = 10.0
     grid_indices = jnp.floor(positions / grid_scale).astype(jnp.int32)
     grid_ids = grid_indices[:, 0] * 1000 + grid_indices[:, 1]
     grid_ids = jnp.where(region_mask, grid_ids, -1)
