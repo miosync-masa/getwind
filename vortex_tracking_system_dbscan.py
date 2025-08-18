@@ -47,7 +47,7 @@ def detect_vortices_dbscan(
     active_mask: np.ndarray,
     eps: float = 15.0,      # 近傍半径
     min_samples: int = 3,   # 最小粒子数
-    Q_threshold: float = 0.1
+    Q_threshold: float = 0.5
 ) -> List[Vortex]:
     """DBSCANで渦を検出"""
     
@@ -127,7 +127,7 @@ def compute_circulation(
 
 def filter_strong_vortices(
     vortices: List[Vortex],
-    min_circulation: float = 0.5,
+    min_circulation: float = 2.0,
     min_particles: int = 5,
     x_max: float = 250.0  # 障害物から離れすぎた渦は除外
 ) -> List[Vortex]:
