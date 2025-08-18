@@ -340,7 +340,6 @@ def detect_DeltaLambdaC(efficiency: float, prev_efficiency: float,
 # ==============================
 # 構造間相互作用（Λ³の本質！）
 # ==============================
-
 @jit
 def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
                                  Lambda_core_i: jnp.ndarray,
@@ -352,22 +351,25 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
                                  neighbor_sigma_s: jnp.ndarray,
                                  neighbor_mask: jnp.ndarray,
                                  config: GETWindConfig) -> jnp.ndarray:
-    """構造間相互作用（Λ³ Enhanced）"""
+    """構造間相互作用（Λ³ Enhanced + Vortex Merging）"""
     
     dr = neighbor_positions - pos_i
     distances = jnp.linalg.norm(dr, axis=1) + 1e-8
-    valid = neighbor_mask & (distances < 12.0)
     
-    # === 1. テンション密度の勾配による力 ===
+    # 🔧 相互作用範囲を拡大！（渦の結合のため）
+    near_range = neighbor_mask & (distances < 15.0)   # 近距離
+    far_range = neighbor_mask & (distances < 30.0)    # 遠距離（渦結合用）
+    
+    # === 1. テンション密度の勾配による力（変更なし） ===
     drho = neighbor_rho_T - rho_T_i
     grad_rho_force = jnp.sum(
-        jnp.where(valid[:, None], 
+        jnp.where(near_range[:, None], 
                   (drho[:, None] / distances[:, None]**2) * dr * config.density_beta,
                   0),
         axis=0
     )
     
-    # === 2. 構造テンソルの差による力 ===
+    # === 2. 構造テンソルの差による力（範囲拡大） ===
     Lambda_core_2x2 = Lambda_core_i.reshape(2, 2)
     
     def compute_tensor_force(idx):
@@ -379,46 +381,78 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
         
         # 構造の不一致による反発/引力
         direction = dr[idx] / distances[idx]
-        force_mag = diff_norm * jnp.exp(-distances[idx] / 10.0)
+        force_mag = diff_norm * jnp.exp(-distances[idx] / 15.0)  # 10→15
         
         # 同期率で重み付け
         sync_weight = 1.0 + (neighbor_sigma_s[idx] - sigma_s_i)
         
         force = direction * force_mag * sync_weight * config.structure_coupling
         
-        return jnp.where(valid[idx], force, jnp.zeros(2))
+        return jnp.where(near_range[idx], force, jnp.zeros(2))
     
     tensor_forces = vmap(compute_tensor_force)(jnp.arange(len(neighbor_positions)))
     tensor_force = jnp.sum(tensor_forces, axis=0)
     
-    # === 3. 渦的相互作用（構造的） ===
+    # === 3. 渦的相互作用（強化版！） ===
     vorticity_i = Lambda_core_2x2[1, 0] - Lambda_core_2x2[0, 1]
     
+    # 3a. 基本的な渦の回転力（近距離）
     tangent = jnp.stack([-dr[:, 1], dr[:, 0]], axis=1) / distances[:, None]
     
-    vortex_force = jnp.sum(
+    vortex_rotation = jnp.sum(
         jnp.where(
-            valid[:, None],
-            tangent * vorticity_i * jnp.exp(-distances[:, None] / 15.0) * 0.1,
+            near_range[:, None],
+            tangent * vorticity_i * jnp.exp(-distances[:, None] / 15.0) * 0.2,  # 0.1→0.2
             0
         ),
         axis=0
     )
     
-    # === 4. 粘性的相互作用 ===
-    mean_Lambda_F = jnp.sum(
-        jnp.where(valid[:, None], neighbor_Lambda_F, 0),
-        axis=0
-    ) / jnp.maximum(jnp.sum(valid), 1)
+    # 🆕 3b. 同回転渦の結合力（遠距離まで作用）
+    def compute_vortex_merging(idx):
+        # 近傍の渦度
+        neighbor_vorticity = neighbor_Lambda_core[idx].reshape(2, 2)[1, 0] - \
+                           neighbor_Lambda_core[idx].reshape(2, 2)[0, 1]
+        
+        # 同じ回転方向かチェック
+        same_rotation = vorticity_i * neighbor_vorticity > 0
+        
+        # 渦度の強さに比例した引力（同回転のみ）
+        attraction = jnp.abs(neighbor_vorticity * vorticity_i) * same_rotation
+        
+        # 距離に応じた減衰（でも遠くまで届く）
+        r = distances[idx]
+        force_mag = attraction * jnp.exp(-r / 25.0) * (1 - jnp.exp(-r / 3.0))  # 近すぎると弱い
+        
+        # 引力の方向
+        direction = dr[idx] / r
+        
+        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.15, jnp.zeros(2))
     
-    effective_viscosity = jnp.minimum(config.viscosity_factor * 0.05, 0.2)
+    vortex_merging = jnp.sum(
+        vmap(compute_vortex_merging)(jnp.arange(len(neighbor_positions))),
+        axis=0
+    )
+    
+    # 渦力の合計
+    vortex_force = vortex_rotation + vortex_merging
+    
+    # === 4. 粘性的相互作用（調整版） ===
+    mean_Lambda_F = jnp.sum(
+        jnp.where(near_range[:, None], neighbor_Lambda_F, 0),
+        axis=0
+    ) / jnp.maximum(jnp.sum(near_range), 1)
+    
+    # 🔧 粘性を渦度に応じて調整（渦が強い時は粘性下げる）
+    vorticity_factor = jnp.exp(-jnp.abs(vorticity_i) / 2.0)  # 渦が強いと粘性減
+    effective_viscosity = jnp.minimum(config.viscosity_factor * 0.05 * vorticity_factor, 0.2)
     viscous_force = effective_viscosity * (mean_Lambda_F - Lambda_F_i)
     
-    # 全体の力を合成（制限付き）
+    # === 5. 全体の力を合成 ===
     total_interaction = grad_rho_force + tensor_force + vortex_force + viscous_force
     
-    # 相互作用力の大きさを制限
-    max_interaction = 3.0
+    # 相互作用力の大きさを制限（少し緩める）
+    max_interaction = 5.0  # 3.0→5.0
     interaction_norm = jnp.linalg.norm(total_interaction)
     total_interaction = jnp.where(
         interaction_norm > max_interaction,
