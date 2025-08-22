@@ -18,7 +18,131 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 
-# [前のコードの基本構造は同じ...]
+# ==============================
+# データ構造（超シンプル！）
+# ==============================
+
+@dataclass
+class Vortex:
+    """渦の情報"""
+    center: np.ndarray      # (x, y)
+    n_particles: int        # 粒子数
+    circulation: float      # 循環
+    cluster_id: int        # DBSCANのクラスタID
+    
+@dataclass
+class VortexSnapshot:
+    """1ステップの渦情報"""
+    step: int
+    vortices: List[Vortex]
+    total_particles: int
+
+# ==============================
+# 渦検出（DBSCAN使用）
+# ==============================
+
+def detect_vortices_dbscan(
+    positions: np.ndarray,
+    Lambda_F: np.ndarray,
+    Q_criterion: np.ndarray,
+    active_mask: np.ndarray,
+    eps: float = 15.0,      # 近傍半径
+    min_samples: int = 3,   # 最小粒子数
+    Q_threshold: float = 0.1
+) -> List[Vortex]:
+    """DBSCANで渦を検出"""
+    
+    # Q > threshold の粒子だけ抽出
+    q_mask = active_mask & (Q_criterion > Q_threshold)
+    vortex_positions = positions[q_mask]
+    vortex_Lambda_F = Lambda_F[q_mask]
+    
+    if len(vortex_positions) < min_samples:
+        return []
+    
+    # DBSCAN実行
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(vortex_positions)
+    labels = clustering.labels_
+    
+    # 各クラスタ = 渦
+    vortices = []
+    for cluster_id in set(labels):
+        if cluster_id == -1:  # ノイズは無視
+            continue
+            
+        # このクラスタの粒子
+        cluster_mask = labels == cluster_id
+        cluster_positions = vortex_positions[cluster_mask]
+        cluster_Lambda_F = vortex_Lambda_F[cluster_mask]
+        
+        # 中心計算
+        center = np.mean(cluster_positions, axis=0)
+        
+        # 循環計算
+        circulation = compute_circulation(
+            cluster_Lambda_F,
+            cluster_positions,
+            center
+        )
+        
+        vortices.append(Vortex(
+            center=center,
+            n_particles=len(cluster_positions),
+            circulation=circulation,
+            cluster_id=cluster_id
+        ))
+    
+    return vortices
+
+def compute_circulation(
+    Lambda_F: np.ndarray,
+    positions: np.ndarray,
+    center: np.ndarray
+) -> float:
+    """循環を計算（物理的に正しい版）"""
+    
+    # 中心からの相対位置
+    rel_pos = positions - center
+    distances = np.linalg.norm(rel_pos, axis=1) + 1e-8
+    
+    # 接線ベクトル（反時計回りを正とする基準）
+    tangent = np.stack([-rel_pos[:, 1], rel_pos[:, 0]], axis=1)
+    tangent = tangent / distances[:, None]
+    
+    # v·t （速度と接線の内積）
+    v_tangential = np.sum(Lambda_F * tangent, axis=1)
+    
+    # 距離で重み付け
+    weights = np.exp(-distances / 10.0)
+    
+    # 重み付き平均
+    # circulation > 0: 反時計回り（CCW）
+    # circulation < 0: 時計回り（CW）
+    circulation = np.sum(v_tangential * weights) / np.sum(weights)
+    
+    return circulation
+
+# ==============================
+# 渦のフィルタリング（新規追加！）
+# ==============================
+
+def filter_strong_vortices(
+    vortices: List[Vortex],
+    min_circulation: float = 0.5,
+    min_particles: int = 5,
+    x_max: float = 250.0  # 障害物から離れすぎた渦は除外
+) -> List[Vortex]:
+    """強い渦のみを抽出"""
+    
+    strong_vortices = []
+    for vortex in vortices:
+        if (abs(vortex.circulation) >= min_circulation and
+            vortex.n_particles >= min_particles and
+            vortex.center[0] <= x_max):
+            strong_vortices.append(vortex)
+    
+    return strong_vortices
+
 
 # ==============================
 # 改良版トラッカー（ハンガリアン法）
@@ -264,10 +388,113 @@ def compute_strouhal_from_lift(
         return 0.0
 
 # ==============================
-# 改良版メイン処理
+# サブ関数
 # ==============================
 
-def process_simulation_data_v2(
+def analyze_snapshots(snapshots: List[VortexSnapshot]) -> Dict:
+    """スナップショットから統計を計算"""
+    
+    # 渦数の時系列
+    n_vortices = [len(s.vortices) for s in snapshots]
+    
+    # 上下の渦を分離
+    upper_counts = []
+    lower_counts = []
+    
+    for snapshot in snapshots:
+        upper = sum(1 for v in snapshot.vortices if v.center[1] > 75)
+        lower = sum(1 for v in snapshot.vortices if v.center[1] <= 75)
+        upper_counts.append(upper)
+        lower_counts.append(lower)
+    
+    return {
+        'n_vortices': n_vortices,
+        'upper_counts': upper_counts,
+        'lower_counts': lower_counts,
+        'steps': [s.step for s in snapshots]
+    }
+    
+# ==============================
+# 可視化
+# ==============================
+
+def visualize_snapshot(snapshot: VortexSnapshot, ax=None):
+    """1つのスナップショットを可視化"""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 5))
+    
+    for vortex in snapshot.vortices:
+        # 渦の中心
+        ax.scatter(vortex.center[0], vortex.center[1], 
+                  s=vortex.n_particles*10,  # サイズは粒子数
+                  c='red' if vortex.center[1] > 75 else 'blue',
+                  alpha=0.6)
+        
+        # 循環の向きを矢印で表示
+        if vortex.circulation > 0:
+            marker = '⟲'  # 反時計回り
+        else:
+            marker = '⟳'  # 時計回り
+        ax.text(vortex.center[0], vortex.center[1], marker, 
+               fontsize=12, ha='center', va='center')
+    
+    # 障害物
+    circle = plt.Circle((100, 75), 20, fill=False, color='black', linewidth=2)
+    ax.add_patch(circle)
+    
+    ax.set_xlim(0, 300)
+    ax.set_ylim(0, 150)
+    ax.set_aspect('equal')
+    ax.set_title(f'Step {snapshot.step}: {len(snapshot.vortices)} vortices')
+    
+    return ax
+
+def plot_vortex_timeline(snapshots: List[VortexSnapshot], tracker: VortexTracker):
+    """渦の時系列プロット"""
+    
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    
+    # 上: 渦数の時間変化
+    stats = analyze_snapshots(snapshots)
+    ax = axes[0]
+    ax.plot(stats['steps'], stats['n_vortices'], 'k-', label='Total', alpha=0.5)
+    ax.plot(stats['steps'], stats['upper_counts'], 'r-', label='Upper')
+    ax.plot(stats['steps'], stats['lower_counts'], 'b-', label='Lower')
+    ax.set_ylabel('Number of Vortices')
+    ax.set_xlabel('Step')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 下: 渦の軌跡（強い渦のみ）
+    ax = axes[1]
+    for vortex_id, track in tracker.tracks.items():
+        if len(track) > 5:  # 短い軌跡は除外
+            # 最大循環をチェック
+            max_circulation = max(abs(t[2]) for t in track)
+            if max_circulation > 0.5:  # 強い渦のみ表示
+                positions = np.array([t[1] for t in track])
+                # 上下で色分け
+                color = 'red' if positions[0, 1] > 75 else 'blue'
+                ax.plot(positions[:, 0], positions[:, 1], 
+                       color=color, alpha=0.6, linewidth=1.5)
+    
+    # 障害物
+    circle = plt.Circle((100, 75), 20, fill=False, color='black', linewidth=2)
+    ax.add_patch(circle)
+    
+    ax.set_xlim(0, 300)
+    ax.set_ylim(0, 150)
+    ax.set_aspect('equal')
+    ax.set_title('Vortex Trajectories (Strong Vortices Only)')
+    
+    plt.tight_layout()
+    return fig
+
+# ==============================
+# メイン処理
+# ==============================
+
+def process_simulation_data(
     states,
     config,
     save_file: str = 'vortex_analysis_v2.npz'
