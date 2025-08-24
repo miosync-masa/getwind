@@ -1228,7 +1228,6 @@ def run_simulation_v62(map_file: str, config: GETWindConfig, seed: int = 42, sav
         
         # 状態を保存
         if save_states:
-            state_history.append(state_np)
             state_np = ParticleState(
                 position=np.array(state.position),
                 Lambda_F=np.array(state.Lambda_F),
