@@ -260,19 +260,15 @@ class VortexTracker:
 # 揚力係数によるStrouhal数計算
 # ==============================
 
-def compute_lift_coefficient(
-    state,  # ParticleState
-    config  # GETWindConfig
-) -> float:
-    """揚力係数CLを計算"""
+def compute_lift_coefficient(state, config):
+    """修正版：符号付き揚力係数"""
     
-    # 障害物近傍の粒子を抽出
+    # 障害物近傍の粒子
     dx = state.position[:, 0] - config.obstacle_center_x
     dy = state.position[:, 1] - config.obstacle_center_y
     r = np.sqrt(dx**2 + dy**2)
     
-    # 表面近傍（1.0-1.5倍の半径）
-    near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 1.5) & state.is_active
+    near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 2.0) & state.is_active
     
     if np.sum(near_surface) < 10:
         return 0.0
@@ -280,20 +276,23 @@ def compute_lift_coefficient(
     # 角度
     theta = np.arctan2(dy[near_surface], dx[near_surface])
     
-    # 各粒子の圧力寄与（簡易モデル）
-    # 圧力 ∝ (1 - |v|²/U∞²)
+    # 圧力係数（ベルヌーイ）
     velocity_mag = np.linalg.norm(state.Lambda_F[near_surface], axis=1)
     Cp = 1.0 - (velocity_mag / config.Lambda_F_inlet)**2
     
-    # 揚力への寄与（y方向成分）
-    # dL = -p * sin(θ) * ds
-    lift_contributions = -Cp * np.sin(theta)
+    # ★重要：符号付き揚力！
+    # 上側（θ>0）と下側（θ<0）で別々に計算
+    upper_mask = theta > 0
+    lower_mask = theta <= 0
     
-    # 平均化
-    CL = np.mean(lift_contributions) * 2.0  # 係数調整
+    CL_upper = np.sum(Cp[upper_mask] * np.sin(theta[upper_mask])) if np.any(upper_mask) else 0
+    CL_lower = np.sum(Cp[lower_mask] * np.sin(theta[lower_mask])) if np.any(lower_mask) else 0
     
-    return CL
-
+    # 上下の差が揚力
+    CL = (CL_upper - CL_lower) / np.sum(near_surface)
+    
+    return CL * 10.0  # 正規化係数
+    
 def compute_strouhal_from_lift(
     states,  # List of ParticleState
     config,  # GETWindConfig
