@@ -1465,9 +1465,9 @@ if __name__ == "__main__":
         # Λ³パラメータ
         thermal_alpha=0.002,
         density_beta=0.003,
-        structure_coupling=0.002,
-        viscosity_factor = 40.0,
-        interaction_strength=0.05,
+        structure_coupling=0.004,
+        viscosity_factor = 44.0,
+        interaction_strength=0.06,
         
         # 効率パラメータ
         efficiency_threshold=0.1,
