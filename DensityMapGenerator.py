@@ -146,16 +146,38 @@ class DensityFieldCalculator:
             v[inside] = 0
             
         elif self.obstacle.shape_type == 'square':
-            # 角柱の簡易モデル
-            dx = np.abs(self.X - self.obstacle.center_x)
-            dy = np.abs(self.Y - self.obstacle.center_y)
-            inside = (dx <= self.obstacle.size) & (dy <= self.obstacle.size)
+            # 相対位置
+            dx = self.X - self.obstacle.center_x
+            dy = self.Y - self.obstacle.center_y
+            
+            # 角柱内部
+            inside = (np.abs(dx) <= self.obstacle.size) & (np.abs(dy) <= self.obstacle.size)
+            
+            # 角柱外部のポテンシャル流（近似解）
+            # 角からの距離
+            corner_dist = np.sqrt((np.abs(dx) - self.obstacle.size)**2 + 
+                                 (np.abs(dy) - self.obstacle.size)**2)
+            
+            # 流れの偏向
+            deflection_x = np.where(np.abs(dx) > self.obstacle.size,
+                                    1.0 - (self.obstacle.size**2 / (dx**2 + 1e-8)),
+                                    0.0)
+            deflection_y = np.where(np.abs(dy) > self.obstacle.size,
+                                    1.0 - (self.obstacle.size**2 / (dy**2 + 1e-8)),
+                                    0.0)
+            
+            # 速度場の修正
+            u = u * deflection_x
+            v = v * deflection_y
+            
+            # エッジでの剥離点（角の位置で固定）
+            edge_mask = (corner_dist < 5.0) & ~inside
+            u[edge_mask] *= 0.5  # エッジでの速度低下
+            v[edge_mask] *= 0.5
+            
+            # 内部は速度ゼロ
             u[inside] = 0
             v[inside] = 0
-            
-            # エッジ効果（簡易）
-            edge_region = (dx <= self.obstacle.size * 1.5) & (dy <= self.obstacle.size * 1.5) & ~inside
-            u[edge_region] *= 0.7
             
         return u, v
     
