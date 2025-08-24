@@ -379,7 +379,7 @@ def plot_clean_vortex_trajectories(tracker, figsize=(14, 7)):
     # 有効な軌跡をフィルタリング
     valid_tracks = []
     for track_id, track in tracker.tracks.items():
-        if len(track) < 30:  # 30ステップ以上続いた渦のみ
+        if len(track) < 10:  # 30ステップ以上続いた渦のみ
             continue
             
         positions = np.array([t[1] for t in track])
@@ -398,12 +398,12 @@ def plot_clean_vortex_trajectories(tracker, figsize=(14, 7)):
             
         # 総移動距離チェック
         total_dist = np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1))
-        if total_dist < 30 or total_dist > 600:
+        if total_dist < 20 or total_dist > 800:
             continue
             
         # 平均循環強度
         mean_circ = np.mean(np.abs(circulations))
-        if mean_circ < 0.5:
+        if mean_circ < 0.3:
             continue
             
         valid_tracks.append((track_id, positions, mean_circ))
