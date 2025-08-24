@@ -253,7 +253,7 @@ def compute_strouhal_from_lift_fixed(states, config, debug=True):
         CL_history.append(CL)
     
     # 初期の過渡応答を除去
-    CL_signal = np.array(CL_history[100:])  # 最初の1000ステップを除外
+    CL_signal = np.array(CL_history[1000:])  # 最初の1000ステップを除外
     
     if len(CL_signal) < 500:
         print("Warning: Not enough data for accurate FFT")
@@ -274,7 +274,7 @@ def compute_strouhal_from_lift_fixed(states, config, debug=True):
     
     # FFT実行
     fft = np.fft.fft(CL_padded)
-    freqs = np.fft.fftfreq(n_padded, config.dt)
+    freqs = np.fft.fftfreq(n_padded, config.dt) 
     
     # パワースペクトル
     power = np.abs(fft)**2
@@ -299,7 +299,7 @@ def compute_strouhal_from_lift_fixed(states, config, debug=True):
         # ★重要：カルマン渦の周波数補正
         # 上下の剥離を1セットとして数えている場合は2倍する
         # 実験的に求めた補正係数
-        frequency_correction = 2.0  # 上下剥離のペアを考慮
+        frequency_correction = 1.0  # 上下剥離のペアを考慮
         
         # Strouhal数を計算
         D = 2 * config.obstacle_size
