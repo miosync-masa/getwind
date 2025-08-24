@@ -411,7 +411,11 @@ def plot_clean_vortex_trajectories(tracker, figsize=(14, 7)):
             label = 'Upper vortex' if track_id == valid_tracks[0][0] else None
         else:
             color = 'blue'
-            label = 'Lower vortex' if track_id == valid_tracks[1][0] if len(valid_tracks) > 1 else valid_tracks[0][0] else None
+            # シンプルに修正
+            if len(valid_tracks) > 1 and track_id == valid_tracks[1][0]:
+                label = 'Lower vortex'
+            else:
+                label = None
         
         # 軌跡を描画
         ax.plot(positions[:, 0], positions[:, 1],
