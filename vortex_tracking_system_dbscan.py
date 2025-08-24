@@ -190,13 +190,23 @@ class SimpleVortexTracker:
 def compute_lift_coefficient_fixed(state, config):
     """修正版：物理的に正しい揚力係数"""
     
+    # stateが辞書の場合の処理
+    if isinstance(state, dict):
+        position = state['position']
+        Lambda_F = state['Lambda_F']
+        is_active = state['is_active']
+    else:
+        position = state.position
+        Lambda_F = state.Lambda_F
+        is_active = state.is_active
+    
     # 障害物表面近傍の粒子を選択
-    dx = state.position[:, 0] - config.obstacle_center_x
-    dy = state.position[:, 1] - config.obstacle_center_y
+    dx = position[:, 0] - config.obstacle_center_x
+    dy = position[:, 1] - config.obstacle_center_y
     r = np.sqrt(dx**2 + dy**2)
     
     # 表面近傍（1.0-2.0倍の半径）
-    near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 2.0) & state.is_active
+    near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 2.0) & is_active
     
     if np.sum(near_surface) < 10:
         return 0.0
@@ -205,7 +215,7 @@ def compute_lift_coefficient_fixed(state, config):
     theta = np.arctan2(dy[near_surface], dx[near_surface])
     
     # 速度の大きさから圧力係数を計算（ベルヌーイの定理）
-    velocity_mag = np.linalg.norm(state.Lambda_F[near_surface], axis=1)
+    velocity_mag = np.linalg.norm(Lambda_F[near_surface], axis=1)
     Cp = 1.0 - (velocity_mag / config.Lambda_F_inlet)**2
     
     # 揚力への寄与（-p * sin(θ) * dS）
@@ -511,21 +521,23 @@ def process_simulation_results(
             if i % 500 == 0:
                 print(f"  Step {i}/{len(states)}")
             
-            # 構造体に変換
-            class StateStruct:
-                def __init__(self, state_dict):
-                    self.position = state_dict['position']
-                    self.Lambda_F = state_dict['Lambda_F']
-                    self.Q_criterion = state_dict['Q_criterion']
-                    self.is_active = state_dict['is_active']
-            
-            state_struct = StateStruct(state)
+            # stateが辞書の場合の処理
+            if isinstance(state, dict):
+                positions = state['position']
+                Lambda_F = state['Lambda_F']
+                Q_criterion = state['Q_criterion']
+                is_active = state['is_active']
+            else:
+                positions = state.position
+                Lambda_F = state.Lambda_F
+                Q_criterion = state.Q_criterion
+                is_active = state.is_active
             
             vortices = detect_vortices_dbscan(
-                state_struct.position,
-                state_struct.Lambda_F,
-                state_struct.Q_criterion,
-                state_struct.is_active,
+                positions,
+                Lambda_F,
+                Q_criterion,
+                is_active,
                 eps=25.0,
                 min_samples=8,
                 Q_threshold=0.2
