@@ -253,9 +253,9 @@ def compute_strouhal_from_lift_fixed(states, config, debug=True):
         CL_history.append(CL)
     
     # 初期の過渡応答を除去
-    CL_signal = np.array(CL_history[1000:])  # 最初の1000ステップを除外
+    CL_signal = np.array(CL_history[100:])  # 最初の1000ステップを除外
     
-    if len(CL_signal) < 1000:
+    if len(CL_signal) < 500:
         print("Warning: Not enough data for accurate FFT")
         return 0.0
     
