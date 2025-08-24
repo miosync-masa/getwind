@@ -1466,7 +1466,7 @@ if __name__ == "__main__":
         thermal_alpha=0.002,
         density_beta=0.003,
         structure_coupling=0.002,
-        viscosity_factor=2.0,  # Re=200
+        viscosity_factor = 40.0,
         interaction_strength=0.05,
         
         # 効率パラメータ
