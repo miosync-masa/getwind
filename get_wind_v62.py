@@ -351,36 +351,52 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
                                  neighbor_sigma_s: jnp.ndarray,
                                  neighbor_mask: jnp.ndarray,
                                  config: GETWindConfig) -> jnp.ndarray:
-    """構造間相互作用（Λ³ Enhanced + Vortex Merging + 局所性）"""
+    """構造間相互作用（Λ³ Enhanced + 段階的減衰）"""
     
-    # 🆕 障害物からの距離による影響圏チェック
+    # 🆕 障害物からの距離
     distance_from_obstacle_x = pos_i[0] - config.obstacle_center_x
     
-    # 障害物の影響圏内かチェック（150単位まで）
-    in_influence_zone = distance_from_obstacle_x < 150.0
-    
-    # 影響圏外なら相互作用なし
-    zero_force = jnp.zeros(2)
-    
-    # === 以下、影響圏内のみ計算 ===
+    # 🆕 段階的減衰（100単位から徐々に弱まる）
+    # 100まで：完全な相互作用（1.0）
+    # 100〜200：指数関数的に減衰
+    # 200以降：ゼロ
+    decay_factor = jnp.where(
+        distance_from_obstacle_x < 100.0,
+        1.0,
+        jnp.where(
+            distance_from_obstacle_x < 200.0,
+            jnp.exp(-(distance_from_obstacle_x - 100.0) / 50.0),  # 減衰長50単位
+            0.0
+        )
+    )
     
     dr = neighbor_positions - pos_i
     distances = jnp.linalg.norm(dr, axis=1) + 1e-8
     
     # 相互作用範囲
-    near_range = neighbor_mask & (distances < 15.0)   # 近距離
-    far_range = neighbor_mask & (distances < 30.0)    # 遠距離（渦結合用）
+    near_range = neighbor_mask & (distances < 15.0)
+    far_range = neighbor_mask & (distances < 30.0)
     
-    # 🆕 近傍粒子も影響圏内にいるかチェック
-    neighbor_in_zone = (neighbor_positions[:, 0] - config.obstacle_center_x) < 150.0
-    near_range = near_range & neighbor_in_zone
-    far_range = far_range & neighbor_in_zone
+    # 🆕 近傍粒子も減衰を考慮
+    neighbor_decay = jnp.where(
+        (neighbor_positions[:, 0] - config.obstacle_center_x) < 100.0,
+        1.0,
+        jnp.where(
+            (neighbor_positions[:, 0] - config.obstacle_center_x) < 200.0,
+            jnp.exp(-((neighbor_positions[:, 0] - config.obstacle_center_x) - 100.0) / 50.0),
+            0.0
+        )
+    )
     
+    # 平均減衰率を計算
+    combined_decay = jnp.sqrt(decay_factor * neighbor_decay)
+    
+    # [既存の力計算部分はそのまま...]
     # === 1. テンション密度の勾配による力 ===
     drho = neighbor_rho_T - rho_T_i
     grad_rho_force = jnp.sum(
         jnp.where(near_range[:, None], 
-                  (drho[:, None] / distances[:, None]**2) * dr * config.density_beta,
+                  (drho[:, None] / distances[:, None]**2) * dr * config.density_beta * combined_decay[:, None],
                   0),
         axis=0
     )
@@ -465,23 +481,21 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     viscous_force = effective_viscosity * (mean_Lambda_F - Lambda_F_i)
     
     # === 5. 全体の力を合成（影響圏内のみ） ===
-    total_interaction_in_zone = grad_rho_force + tensor_force + vortex_force + viscous_force
+    total_interaction = grad_rho_force + tensor_force + vortex_force + viscous_force
+    
+    # 🆕 全体に減衰を適用
+    total_interaction = total_interaction * decay_factor
     
     # 相互作用力の大きさを制限
     max_interaction = 5.0
-    interaction_norm = jnp.linalg.norm(total_interaction_in_zone)
-    total_interaction_in_zone = jnp.where(
+    interaction_norm = jnp.linalg.norm(total_interaction)
+    total_interaction = jnp.where(
         interaction_norm > max_interaction,
-        total_interaction_in_zone * max_interaction / interaction_norm,
-        total_interaction_in_zone
+        total_interaction * max_interaction / interaction_norm,
+        total_interaction
     )
     
-    # 🆕 影響圏の内外で切り替え
-    return jnp.where(
-        in_influence_zone,
-        total_interaction_in_zone,
-        zero_force
-    )
+    return total_interaction
 
 # ==============================
 # トポロジカル保存フィードバック
