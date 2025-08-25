@@ -250,14 +250,18 @@ class DensityFieldCalculator:
             separation[in_boundary & strong_separation] = 1.0
             
         elif self.obstacle.shape_type == 'square':
-            # 角柱の場合（エッジで剥離）
             dx = self.X - self.obstacle.center_x
             dy = self.Y - self.obstacle.center_y
             
-            # 前縁エッジ付近
-            edge_x = np.abs(dx - self.obstacle.size) < 5
-            edge_y = np.abs(dy) < self.obstacle.size
-            separation[edge_x & edge_y] = 1.0
+            # 前縁エッジ（左側！）← ここが重要！
+            front_edge = (np.abs(dx + self.obstacle.size) < 5) & \
+                         (np.abs(dy) <= self.obstacle.size)
+            separation[front_edge] = 1.0
+            
+            # 4つの角での剥離も追加
+            corners = ((np.abs(np.abs(dx) - self.obstacle.size) < 3) & \
+                       (np.abs(np.abs(dy) - self.obstacle.size) < 3))
+            separation[corners] = 1.0
             
         return separation
     
