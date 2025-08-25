@@ -33,7 +33,7 @@ print(f"JAX devices: {jax.devices()}")
 class GETWindConfig(NamedTuple):
     """GET Wind™ v6.2 設定（Λ³ Enhanced + Spatial Coherence）"""
     #  障害物形状
-    obstacle_shape: int = 0　# 0=cylinder, 1=square
+    obstacle_shape: int = 0 #0=cylinder, 1=square
     # シミュレーション領域
     domain_width: float = 300.0
     domain_height: float = 150.0
