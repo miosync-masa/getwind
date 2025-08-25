@@ -899,10 +899,11 @@ def physics_step_v62(state: ParticleState,
         # 角柱の場合：エッジベースの固定剥離
         # 前縁（x = center_x + size）のエッジで剥離
         at_front_edge = (
-            (jnp.abs(particle_dx - config.obstacle_size) < 3.0) &  # 前縁エッジ付近
-            (jnp.abs(particle_dy) <= config.obstacle_size + 2.0)   # y方向の範囲内
+            (particle_dx > config.obstacle_size - 5.0) &  # 前縁手前から
+            (particle_dx < config.obstacle_size + 10.0) &  # 後ろまで含む
+            (jnp.abs(particle_dy) <= config.obstacle_size + 5.0)  # y方向も広く
         )
-        
+                
         # 角（コーナー）での剥離も考慮
         at_corner = (
             (jnp.abs(jnp.abs(particle_dx) - config.obstacle_size) < 3.0) &
@@ -1038,10 +1039,10 @@ def physics_step_v62(state: ParticleState,
         # 角柱：エッジから強く剥離
         square_pull = jnp.where(
             dynamic_separation,
-            jnp.array([0.3, jnp.where(is_upper, -0.4, 0.4)]),  # より強い剥離
+            jnp.array([0.5, jnp.where(is_upper, -0.8, 0.8)]),  # 2倍に！
             jnp.zeros(2)
         )
-        
+                
         vortex_pull = lax.cond(
             is_cylinder,
             lambda _: cylinder_pull,
