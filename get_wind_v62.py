@@ -753,8 +753,8 @@ def compute_dynamic_separation_angle(state: ParticleState, config: GETWindConfig
     base_angle = jnp.pi/2  # 90度
     max_shift = jnp.pi/6   # 最大30度シフト
     
-    upper_shift = jnp.tanh(upper_vorticity_sum / 75.0) * max_shift
-    lower_shift = jnp.tanh(lower_vorticity_sum / 75.0) * max_shift
+    upper_shift = jnp.tanh(upper_vorticity_sum / 62.5) * max_shift
+    lower_shift = jnp.tanh(lower_vorticity_sum / 65.5) * max_shift
     
     # 最終的な剥離角度（80〜120度の範囲）
     upper_sep_angle = jnp.clip(base_angle + upper_shift, jnp.pi*4/9, jnp.pi*2/3)
