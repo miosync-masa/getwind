@@ -333,7 +333,7 @@ def detect_DeltaLambdaC(efficiency: float, prev_efficiency: float,
     score += jnp.where(jnp.abs(vorticity) > 0.5, 1.0, 0.0)
     
     # ΔΛCイベント判定
-    is_event = score >= 2.0
+    is_event = score >= 3.0
     
     return is_event, score
 
