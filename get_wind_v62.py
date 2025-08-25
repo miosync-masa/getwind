@@ -317,7 +317,7 @@ def detect_DeltaLambdaC(efficiency: float, prev_efficiency: float,
     
     # 効率の急変
     eff_change = jnp.abs(efficiency - prev_efficiency) / (jnp.abs(prev_efficiency) + 1e-8)
-    score += jnp.where(eff_change > 0.5, 2.0, 0.0) 
+    score += jnp.where(eff_change > 0.5, 2.0, 0.0)
     
     # 同期率の急変
     sigma_jump = jnp.abs(sigma_s - prev_sigma_s)
@@ -351,32 +351,16 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
                                  neighbor_sigma_s: jnp.ndarray,
                                  neighbor_mask: jnp.ndarray,
                                  config: GETWindConfig) -> jnp.ndarray:
-    """構造間相互作用（Λ³ Enhanced + Vortex Merging + 局所性）"""
-    
-    # 🆕 障害物からの距離による影響圏チェック
-    distance_from_obstacle_x = pos_i[0] - config.obstacle_center_x
-    
-    # 障害物の影響圏内かチェック（直径の2.5倍 = 100単位）
-    in_influence_zone = distance_from_obstacle_x < 150.0
-    
-    # 影響圏外なら相互作用なし
-    zero_force = jnp.zeros(2)
-    
-    # === 以下、影響圏内のみ計算 ===
+    """構造間相互作用（Λ³ Enhanced + Vortex Merging）"""
     
     dr = neighbor_positions - pos_i
     distances = jnp.linalg.norm(dr, axis=1) + 1e-8
     
-    # 相互作用範囲
+    # 🔧 相互作用範囲を拡大！（渦の結合のため）
     near_range = neighbor_mask & (distances < 15.0)   # 近距離
     far_range = neighbor_mask & (distances < 30.0)    # 遠距離（渦結合用）
     
-    # 🆕 近傍粒子も影響圏内にいるかチェック
-    neighbor_in_zone = (neighbor_positions[:, 0] - config.obstacle_center_x) < 100.0
-    near_range = near_range & neighbor_in_zone
-    far_range = far_range & neighbor_in_zone
-    
-    # === 1. テンション密度の勾配による力 ===
+    # === 1. テンション密度の勾配による力（変更なし） ===
     drho = neighbor_rho_T - rho_T_i
     grad_rho_force = jnp.sum(
         jnp.where(near_range[:, None], 
@@ -385,7 +369,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
         axis=0
     )
     
-    # === 2. 構造テンソルの差による力 ===
+    # === 2. 構造テンソルの差による力（範囲拡大） ===
     Lambda_core_2x2 = Lambda_core_i.reshape(2, 2)
     
     def compute_tensor_force(idx):
@@ -397,7 +381,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
         
         # 構造の不一致による反発/引力
         direction = dr[idx] / distances[idx]
-        force_mag = diff_norm * jnp.exp(-distances[idx] / 15.0)
+        force_mag = diff_norm * jnp.exp(-distances[idx] / 15.0)  # 10→15
         
         # 同期率で重み付け
         sync_weight = 1.0 + (neighbor_sigma_s[idx] - sigma_s_i)
@@ -409,7 +393,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     tensor_forces = vmap(compute_tensor_force)(jnp.arange(len(neighbor_positions)))
     tensor_force = jnp.sum(tensor_forces, axis=0)
     
-    # === 3. 渦的相互作用 ===
+    # === 3. 渦的相互作用（強化版！） ===
     vorticity_i = Lambda_core_2x2[1, 0] - Lambda_core_2x2[0, 1]
     
     # 3a. 基本的な渦の回転力（近距離）
@@ -418,13 +402,13 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     vortex_rotation = jnp.sum(
         jnp.where(
             near_range[:, None],
-            tangent * vorticity_i * jnp.exp(-distances[:, None] / 15.0) * 0.2,
+            tangent * vorticity_i * jnp.exp(-distances[:, None] / 15.0) * 0.2,  # 0.1→0.2
             0
         ),
         axis=0
     )
     
-    # 3b. 同回転渦の結合力（遠距離まで作用）
+    # 🆕 3b. 同回転渦の結合力（遠距離まで作用）
     def compute_vortex_merging(idx):
         # 近傍の渦度
         neighbor_vorticity = neighbor_Lambda_core[idx].reshape(2, 2)[1, 0] - \
@@ -436,9 +420,9 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
         # 渦度の強さに比例した引力（同回転のみ）
         attraction = jnp.abs(neighbor_vorticity * vorticity_i) * same_rotation
         
-        # 距離に応じた減衰
+        # 距離に応じた減衰（でも遠くまで届く）
         r = distances[idx]
-        force_mag = attraction * jnp.exp(-r / 25.0) * (1 - jnp.exp(-r / 3.0))
+        force_mag = attraction * jnp.exp(-r / 25.0) * (1 - jnp.exp(-r / 3.0))  # 近すぎると弱い
         
         # 引力の方向
         direction = dr[idx] / r
@@ -453,35 +437,30 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     # 渦力の合計
     vortex_force = vortex_rotation + vortex_merging
     
-    # === 4. 粘性的相互作用 ===
+    # === 4. 粘性的相互作用（調整版） ===
     mean_Lambda_F = jnp.sum(
         jnp.where(near_range[:, None], neighbor_Lambda_F, 0),
         axis=0
     ) / jnp.maximum(jnp.sum(near_range), 1)
     
-    # 粘性を渦度に応じて調整
-    vorticity_factor = jnp.exp(-jnp.abs(vorticity_i) / 2.0)
+    # 🔧 粘性を渦度に応じて調整（渦が強い時は粘性下げる）
+    vorticity_factor = jnp.exp(-jnp.abs(vorticity_i) / 2.0)  # 渦が強いと粘性減
     effective_viscosity = jnp.minimum(config.viscosity_factor * 0.05 * vorticity_factor, 0.2)
     viscous_force = effective_viscosity * (mean_Lambda_F - Lambda_F_i)
     
-    # === 5. 全体の力を合成（影響圏内のみ） ===
-    total_interaction_in_zone = grad_rho_force + tensor_force + vortex_force + viscous_force
+    # === 5. 全体の力を合成 ===
+    total_interaction = grad_rho_force + tensor_force + vortex_force + viscous_force
     
-    # 相互作用力の大きさを制限
-    max_interaction = 5.0
-    interaction_norm = jnp.linalg.norm(total_interaction_in_zone)
-    total_interaction_in_zone = jnp.where(
+    # 相互作用力の大きさを制限（少し緩める）
+    max_interaction = 5.0  # 3.0→5.0
+    interaction_norm = jnp.linalg.norm(total_interaction)
+    total_interaction = jnp.where(
         interaction_norm > max_interaction,
-        total_interaction_in_zone * max_interaction / interaction_norm,
-        total_interaction_in_zone
+        total_interaction * max_interaction / interaction_norm,
+        total_interaction
     )
     
-    # 🆕 影響圏の内外で切り替え
-    return jnp.where(
-        in_influence_zone,
-        total_interaction_in_zone,
-        zero_force
-    )
+    return total_interaction
 
 # ==============================
 # トポロジカル保存フィードバック
@@ -786,7 +765,7 @@ def compute_dynamic_separation_angle(state: ParticleState, config: GETWindConfig
 @jit
 def update_separation_history(prev_angles: Tuple[float, float], 
                              new_angles: Tuple[float, float],
-                             alpha: float = 0.85) -> Tuple[float, float]:
+                             alpha: float = 0.8) -> Tuple[float, float]:
     """剥離点の慣性を考慮（急激な変化を防ぐ）"""
     upper_angle = alpha * prev_angles[0] + (1-alpha) * new_angles[0]
     lower_angle = alpha * prev_angles[1] + (1-alpha) * new_angles[1]
