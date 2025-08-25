@@ -317,7 +317,7 @@ def detect_DeltaLambdaC(efficiency: float, prev_efficiency: float,
     
     # 効率の急変
     eff_change = jnp.abs(efficiency - prev_efficiency) / (jnp.abs(prev_efficiency) + 1e-8)
-    score += jnp.where(eff_change > 0.5, 2.0, 0.0)
+    score += jnp.where(eff_change > 0.8, 2.0, 0.0) 
     
     # 同期率の急変
     sigma_jump = jnp.abs(sigma_s - prev_sigma_s)
