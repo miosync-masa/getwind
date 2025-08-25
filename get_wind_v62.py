@@ -317,7 +317,7 @@ def detect_DeltaLambdaC(efficiency: float, prev_efficiency: float,
     
     # 効率の急変
     eff_change = jnp.abs(efficiency - prev_efficiency) / (jnp.abs(prev_efficiency) + 1e-8)
-    score += jnp.where(eff_change > 0.8, 2.0, 0.0) 
+    score += jnp.where(eff_change > 0.5, 2.0, 0.0) 
     
     # 同期率の急変
     sigma_jump = jnp.abs(sigma_s - prev_sigma_s)
@@ -333,7 +333,7 @@ def detect_DeltaLambdaC(efficiency: float, prev_efficiency: float,
     score += jnp.where(jnp.abs(vorticity) > 0.5, 1.0, 0.0)
     
     # ΔΛCイベント判定
-    is_event = score >= 3.0
+    is_event = score >= 2.0
     
     return is_event, score
 
@@ -369,7 +369,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     
     # 相互作用範囲
     near_range = neighbor_mask & (distances < 15.0)   # 近距離
-    far_range = neighbor_mask & (distances < 22.0)    # 遠距離（渦結合用）
+    far_range = neighbor_mask & (distances < 30.0)    # 遠距離（渦結合用）
     
     # 🆕 近傍粒子も影響圏内にいるかチェック
     neighbor_in_zone = (neighbor_positions[:, 0] - config.obstacle_center_x) < 100.0
@@ -443,7 +443,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
         # 引力の方向
         direction = dr[idx] / r
         
-        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.10, jnp.zeros(2))
+        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.15, jnp.zeros(2))
     
     vortex_merging = jnp.sum(
         vmap(compute_vortex_merging)(jnp.arange(len(neighbor_positions))),
@@ -774,8 +774,8 @@ def compute_dynamic_separation_angle(state: ParticleState, config: GETWindConfig
     base_angle = jnp.pi/2  # 90度
     max_shift = jnp.pi/6   # 最大30度シフト
     
-    upper_shift = jnp.tanh(upper_vorticity_sum / 62.5) * max_shift
-    lower_shift = jnp.tanh(lower_vorticity_sum / 65.5) * max_shift
+    upper_shift = jnp.tanh(upper_vorticity_sum / 50.0) * max_shift
+    lower_shift = jnp.tanh(lower_vorticity_sum / 50.0) * max_shift
     
     # 最終的な剥離角度（80〜120度の範囲）
     upper_sep_angle = jnp.clip(base_angle + upper_shift, jnp.pi*4/9, jnp.pi*2/3)
