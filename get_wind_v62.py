@@ -1644,6 +1644,7 @@ if __name__ == "__main__":
     # 設定（v6.2: 空間同期パラメータ追加）
     config = GETWindConfig(
         # 基本設定
+        obstacle_shape=0,
         particles_per_step=5.0,
         max_particles=1500,
         n_steps=10000,
