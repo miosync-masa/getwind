@@ -358,7 +358,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     
     # 🔧 相互作用範囲を拡大！（渦の結合のため）
     near_range = neighbor_mask & (distances < 15.0)   # 近距離
-    far_range = neighbor_mask & (distances < 30.0)    # 遠距離（渦結合用）
+    far_range = neighbor_mask & (distances < 20.0)    # 遠距離（渦結合用）
     
     # === 1. テンション密度の勾配による力（変更なし） ===
     drho = neighbor_rho_T - rho_T_i
@@ -427,7 +427,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
         # 引力の方向
         direction = dr[idx] / r
         
-        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.15, jnp.zeros(2))
+        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.08, jnp.zeros(2))
     
     vortex_merging = jnp.sum(
         vmap(compute_vortex_merging)(jnp.arange(len(neighbor_positions))),
@@ -765,7 +765,7 @@ def compute_dynamic_separation_angle(state: ParticleState, config: GETWindConfig
 @jit
 def update_separation_history(prev_angles: Tuple[float, float], 
                              new_angles: Tuple[float, float],
-                             alpha: float = 0.8) -> Tuple[float, float]:
+                             alpha: float = 0.85) -> Tuple[float, float]:
     """剥離点の慣性を考慮（急激な変化を防ぐ）"""
     upper_angle = alpha * prev_angles[0] + (1-alpha) * new_angles[0]
     lower_angle = alpha * prev_angles[1] + (1-alpha) * new_angles[1]
