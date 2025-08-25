@@ -521,7 +521,7 @@ def apply_topological_feedback(upper_DQ: float, lower_DQ: float,
     new_Lambda_F = new_Lambda_F * (original_norm / new_norm)
     
     return new_Lambda_F
-
+                                
 # ==============================
 # 近傍探索
 # ==============================
@@ -715,6 +715,63 @@ def detect_karman_vortex_v2(state: ParticleState, config: GETWindConfig) -> Tupl
     return is_karman, stability, metrics
 
 # ==============================
+# 剥離点の変動
+# ==============================
+@jit
+def compute_dynamic_separation_angle(state: ParticleState, config: GETWindConfig) -> Tuple[float, float]:
+    """渦による剥離点の動的計算"""
+    
+    # 円柱表面近傍の粒子を選択
+    dx = state.position[:, 0] - config.obstacle_center_x
+    dy = state.position[:, 1] - config.obstacle_center_y
+    r = jnp.sqrt(dx**2 + dy**2)
+    
+    # 表面から5単位以内
+    near_surface = (r > config.obstacle_size) & (r < config.obstacle_size + 5.0) & state.is_active
+    
+    # 上下半分に分割
+    upper_mask = near_surface & (dy > 0)
+    lower_mask = near_surface & (dy <= 0)
+    
+    # 各領域の渦度の重心位置を計算
+    upper_vorticity_sum = jnp.sum(jnp.where(upper_mask, jnp.abs(state.vorticity), 0))
+    lower_vorticity_sum = jnp.sum(jnp.where(lower_mask, jnp.abs(state.vorticity), 0))
+    
+    # 渦度重み付き角度（渦が強い場所が剥離点を引っ張る）
+    theta = jnp.arctan2(dy, dx)
+    
+    upper_weighted_angle = jnp.sum(
+        jnp.where(upper_mask, theta * jnp.abs(state.vorticity), 0)
+    ) / jnp.maximum(upper_vorticity_sum, 1e-8)
+    
+    lower_weighted_angle = jnp.sum(
+        jnp.where(lower_mask, theta * jnp.abs(state.vorticity), 0)
+    ) / jnp.maximum(lower_vorticity_sum, 1e-8)
+    
+    # 基準角度（90度）からのシフト量を計算
+    # 渦が強いほど後方（120度方向）へシフト
+    base_angle = jnp.pi/2  # 90度
+    max_shift = jnp.pi/6   # 最大30度シフト
+    
+    upper_shift = jnp.tanh(upper_vorticity_sum / 50.0) * max_shift
+    lower_shift = jnp.tanh(lower_vorticity_sum / 50.0) * max_shift
+    
+    # 最終的な剥離角度（80〜120度の範囲）
+    upper_sep_angle = jnp.clip(base_angle + upper_shift, jnp.pi*4/9, jnp.pi*2/3)
+    lower_sep_angle = jnp.clip(-base_angle - lower_shift, -jnp.pi*2/3, -jnp.pi*4/9)
+    
+    return upper_sep_angle, lower_sep_angle
+
+@jit
+def update_separation_history(prev_angles: Tuple[float, float], 
+                             new_angles: Tuple[float, float],
+                             alpha: float = 0.8) -> Tuple[float, float]:
+    """剥離点の慣性を考慮（急激な変化を防ぐ）"""
+    upper_angle = alpha * prev_angles[0] + (1-alpha) * new_angles[0]
+    lower_angle = alpha * prev_angles[1] + (1-alpha) * new_angles[1]
+    return upper_angle, lower_angle
+
+# ==============================
 # メイン物理ステップ（変更なし）
 # ==============================
 
@@ -728,7 +785,7 @@ def physics_step_v62(state: ParticleState,
                     map_nx: int, map_ny: int,
                     config: GETWindConfig,
                     key: random.PRNGKey) -> ParticleState:
-    """v6.2の物理ステップ（Map-Driven + Λ³）"""
+    """v6.2の物理ステップ（Map-Driven + Λ³ + 動的剥離点）"""
     
     active_mask = state.is_active
     N = state.position.shape[0]
@@ -736,6 +793,9 @@ def physics_step_v62(state: ParticleState,
     
     # 近傍探索
     neighbor_indices, neighbor_mask = find_neighbors(state.position, active_mask)
+    
+    # === 🆕 動的剥離点の計算（全粒子共通）===
+    upper_sep_angle, lower_sep_angle = compute_dynamic_separation_angle(state, config)
     
     # トポロジカル統計
     y_rel_all = state.position[:, 1] - config.obstacle_center_y
@@ -772,6 +832,30 @@ def physics_step_v62(state: ParticleState,
         # 勾配
         grad_pressure = compute_gradient_from_map(pressure_map, grid_x, grid_y, map_nx, map_ny)
         grad_density = compute_gradient_from_map(density_map, grid_x, grid_y, map_nx, map_ny)
+        
+        # === 🆕 動的剥離判定の追加 ===
+        particle_dx = pos[0] - config.obstacle_center_x
+        particle_dy = pos[1] - config.obstacle_center_y
+        particle_r = jnp.sqrt(particle_dx**2 + particle_dy**2)
+        particle_theta = jnp.arctan2(particle_dy, particle_dx)
+        
+        # 上半分か下半分か
+        is_upper = particle_dy > 0
+        
+        # 動的剥離条件（渦に引っ張られた剥離点）
+        dynamic_separation = jnp.where(
+            is_upper,
+            (particle_theta > upper_sep_angle) & (particle_theta < jnp.pi) & 
+            (particle_r > config.obstacle_size) & (particle_r < config.obstacle_size + 5.0),
+            (particle_theta < lower_sep_angle) & (particle_theta > -jnp.pi) & 
+            (particle_r > config.obstacle_size) & (particle_r < config.obstacle_size + 5.0)
+        )
+        
+        # マップの剥離値と動的剥離を組み合わせ（より強い方を採用）
+        enhanced_separation = jnp.maximum(
+            local_separation,
+            jnp.where(dynamic_separation, 0.8, 0.0)
+        )
         
         # === 2. Λ³構造テンソルの計算 ===
         neighbor_pos = all_neighbor_positions[i]
@@ -866,18 +950,31 @@ def physics_step_v62(state: ParticleState,
             new_Lambda_F_base
         )
         
-        # 剥離領域での処理
+        # === 🆕 剥離領域での処理（動的剥離対応）===
         sep_key = random.fold_in(key, i * 2000)
-        sep_noise = random.normal(sep_key, (2,)) * local_separation
+        # 剥離の強さに応じたノイズ（強化版を使用）
+        sep_noise = random.normal(sep_key, (2,)) * enhanced_separation
+        
+        # 🆕 剥離時の速度偏向も追加（渦に引っ張られる方向）
+        vortex_pull = jnp.where(
+            dynamic_separation & is_upper,
+            jnp.array([0.2, -0.3]),  # 上側は後方下向き
+            jnp.where(
+                dynamic_separation & ~is_upper,
+                jnp.array([0.2, 0.3]),   # 下側は後方上向き
+                jnp.zeros(2)
+            )
+        ) * enhanced_separation
+        
         new_Lambda_F = jnp.where(
-            local_separation > 0.2,
-            new_Lambda_F + sep_noise,
+            enhanced_separation > 0.2,
+            new_Lambda_F + sep_noise + vortex_pull,
             new_Lambda_F
         )
         
-        # 剥離フラグ更新
+        # 剥離フラグ更新（動的版）
         is_separated = jnp.where(
-            local_separation > 0.2,
+            enhanced_separation > 0.2,
             True,
             state.is_separated[i]
         )
@@ -955,7 +1052,7 @@ def physics_step_v62(state: ParticleState,
     # 全粒子を並列更新
     results = vmap(update_particle)(jnp.arange(N))
     
-    # 結果を展開
+    # 結果を展開（変更なし）
     new_Lambda_F = results[0]
     new_Lambda_FF = results[1]
     new_prev_Lambda_F = results[2]
@@ -1124,6 +1221,9 @@ def inject_particles(state: ParticleState, config: GETWindConfig,
         near_wall=new_near_wall
     )
 
+# ==============================
+# メインシミュレーション
+# ==============================
 # ==============================
 # メインシミュレーション
 # ==============================
