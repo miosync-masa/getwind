@@ -28,11 +28,12 @@ print(f"JAX devices: {jax.devices()}")
 # ==============================
 # Configuration
 # ==============================
+# 形状定数
 
 class GETWindConfig(NamedTuple):
     """GET Wind™ v6.2 設定（Λ³ Enhanced + Spatial Coherence）"""
     #  障害物形状
-    obstacle_shape: str = 'cylinder'
+    obstacle_shape: int = 0　# 0=cylinder, 1=square
     # シミュレーション領域
     domain_width: float = 300.0
     domain_height: float = 150.0
@@ -831,13 +832,13 @@ def physics_step_v62(state: ParticleState,
     neighbor_indices, neighbor_mask = find_neighbors(state.position, active_mask)
     
     # === 🆕 形状判定と剥離点の設定 ===
-    is_cylinder = config.obstacle_shape == 'cylinder'
+    is_cylinder = config.obstacle_shape == SHAPE_CYLINDER
     
     # 円柱の場合は動的剥離点、角柱の場合は固定
     upper_sep_angle, lower_sep_angle = lax.cond(
         is_cylinder,
         lambda _: compute_dynamic_separation_angle(state, config),
-        lambda _: (jnp.pi/2, -jnp.pi/2),  # 角柱は90度固定
+        lambda _: (jnp.pi/2, -jnp.pi/2),
         None
     )
     
@@ -1109,13 +1110,15 @@ def physics_step_v62(state: ParticleState,
         )
         
         # 障害物からの距離（形状別）
-        if is_cylinder:
-            dist_to_obstacle = particle_r - config.obstacle_size
-        else:
-            # 角柱の場合
-            dist_x = jnp.maximum(0, jnp.abs(particle_dx) - config.obstacle_size)
-            dist_y = jnp.maximum(0, jnp.abs(particle_dy) - config.obstacle_size)
-            dist_to_obstacle = jnp.sqrt(dist_x**2 + dist_y**2)
+        dist_to_obstacle = lax.cond(
+            is_cylinder,
+            lambda _: particle_r - config.obstacle_size,
+            lambda _: jnp.sqrt(
+                jnp.maximum(0, jnp.abs(particle_dx) - config.obstacle_size)**2 + 
+                jnp.maximum(0, jnp.abs(particle_dy) - config.obstacle_size)**2
+            ),
+            None
+        )
         
         near_wall = (dist_to_obstacle > 0) & (dist_to_obstacle < 5.0)
         
@@ -1311,9 +1314,6 @@ def inject_particles(state: ParticleState, config: GETWindConfig,
         near_wall=new_near_wall
     )
 
-# ==============================
-# メインシミュレーション
-# ==============================
 # ==============================
 # メインシミュレーション
 # ==============================
