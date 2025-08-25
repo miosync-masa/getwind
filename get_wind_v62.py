@@ -832,7 +832,7 @@ def physics_step_v62(state: ParticleState,
     neighbor_indices, neighbor_mask = find_neighbors(state.position, active_mask)
     
     # === 🆕 形状判定と剥離点の設定 ===
-    is_cylinder = config.obstacle_shape == SHAPE_CYLINDER
+    is_cylinder = config.obstacle_shape == 0
     
     # 円柱の場合は動的剥離点、角柱の場合は固定
     upper_sep_angle, lower_sep_angle = lax.cond(
