@@ -31,6 +31,8 @@ print(f"JAX devices: {jax.devices()}")
 
 class GETWindConfig(NamedTuple):
     """GET Wind™ v6.2 設定（Λ³ Enhanced + Spatial Coherence）"""
+    #  障害物形状
+    obstacle_shape: str = 'cylinder'
     # シミュレーション領域
     domain_width: float = 300.0
     domain_height: float = 150.0
@@ -809,7 +811,6 @@ def update_separation_history(prev_angles: Tuple[float, float],
 # ==============================
 # メイン物理ステップ（変更なし）
 # ==============================
-
 @partial(jit, static_argnums=(8,))
 def physics_step_v62(state: ParticleState,
                     density_map: jnp.ndarray,
@@ -820,7 +821,7 @@ def physics_step_v62(state: ParticleState,
                     map_nx: int, map_ny: int,
                     config: GETWindConfig,
                     key: random.PRNGKey) -> ParticleState:
-    """v6.2の物理ステップ（Map-Driven + Λ³ + 動的剥離点）"""
+    """v6.2の物理ステップ（Map-Driven + Λ³ + 形状別剥離点）"""
     
     active_mask = state.is_active
     N = state.position.shape[0]
@@ -829,8 +830,16 @@ def physics_step_v62(state: ParticleState,
     # 近傍探索
     neighbor_indices, neighbor_mask = find_neighbors(state.position, active_mask)
     
-    # === 🆕 動的剥離点の計算（全粒子共通）===
-    upper_sep_angle, lower_sep_angle = compute_dynamic_separation_angle(state, config)
+    # === 🆕 形状判定と剥離点の設定 ===
+    is_cylinder = config.obstacle_shape == 'cylinder'
+    
+    # 円柱の場合は動的剥離点、角柱の場合は固定
+    upper_sep_angle, lower_sep_angle = lax.cond(
+        is_cylinder,
+        lambda _: compute_dynamic_separation_angle(state, config),
+        lambda _: (jnp.pi/2, -jnp.pi/2),  # 角柱は90度固定
+        None
+    )
     
     # トポロジカル統計
     y_rel_all = state.position[:, 1] - config.obstacle_center_y
@@ -868,7 +877,7 @@ def physics_step_v62(state: ParticleState,
         grad_pressure = compute_gradient_from_map(pressure_map, grid_x, grid_y, map_nx, map_ny)
         grad_density = compute_gradient_from_map(density_map, grid_x, grid_y, map_nx, map_ny)
         
-        # === 🆕 動的剥離判定の追加 ===
+        # === 🆕 形状別の剥離判定 ===
         particle_dx = pos[0] - config.obstacle_center_x
         particle_dy = pos[1] - config.obstacle_center_y
         particle_r = jnp.sqrt(particle_dx**2 + particle_dy**2)
@@ -877,13 +886,36 @@ def physics_step_v62(state: ParticleState,
         # 上半分か下半分か
         is_upper = particle_dy > 0
         
-        # 動的剥離条件（渦に引っ張られた剥離点）
-        dynamic_separation = jnp.where(
+        # 円柱の場合：動的剥離条件（渦に引っ張られた剥離点）
+        cylinder_separation = jnp.where(
             is_upper,
             (particle_theta > upper_sep_angle) & (particle_theta < jnp.pi) & 
             (particle_r > config.obstacle_size) & (particle_r < config.obstacle_size + 5.0),
             (particle_theta < lower_sep_angle) & (particle_theta > -jnp.pi) & 
             (particle_r > config.obstacle_size) & (particle_r < config.obstacle_size + 5.0)
+        )
+        
+        # 角柱の場合：エッジベースの固定剥離
+        # 前縁（x = center_x + size）のエッジで剥離
+        at_front_edge = (
+            (jnp.abs(particle_dx - config.obstacle_size) < 3.0) &  # 前縁エッジ付近
+            (jnp.abs(particle_dy) <= config.obstacle_size + 2.0)   # y方向の範囲内
+        )
+        
+        # 角（コーナー）での剥離も考慮
+        at_corner = (
+            (jnp.abs(jnp.abs(particle_dx) - config.obstacle_size) < 3.0) &
+            (jnp.abs(jnp.abs(particle_dy) - config.obstacle_size) < 3.0)
+        )
+        
+        square_separation = (at_front_edge | at_corner) & (particle_dx > config.obstacle_center_x)
+        
+        # 形状に応じて剥離判定を選択
+        dynamic_separation = lax.cond(
+            is_cylinder,
+            lambda _: cylinder_separation,
+            lambda _: square_separation,
+            None
         )
         
         # マップの剥離値と動的剥離を組み合わせ（より強い方を採用）
@@ -985,13 +1017,14 @@ def physics_step_v62(state: ParticleState,
             new_Lambda_F_base
         )
         
-        # === 🆕 剥離領域での処理（動的剥離対応）===
+        # === 🆕 剥離領域での処理（形状別）===
         sep_key = random.fold_in(key, i * 2000)
         # 剥離の強さに応じたノイズ（強化版を使用）
         sep_noise = random.normal(sep_key, (2,)) * enhanced_separation
         
-        # 🆕 剥離時の速度偏向も追加（渦に引っ張られる方向）
-        vortex_pull = jnp.where(
+        # 🆕 剥離時の速度偏向（形状によって異なる）
+        # 円柱：渦に引っ張られる方向
+        cylinder_pull = jnp.where(
             dynamic_separation & is_upper,
             jnp.array([0.2, -0.3]),  # 上側は後方下向き
             jnp.where(
@@ -999,6 +1032,20 @@ def physics_step_v62(state: ParticleState,
                 jnp.array([0.2, 0.3]),   # 下側は後方上向き
                 jnp.zeros(2)
             )
+        )
+        
+        # 角柱：エッジから強く剥離
+        square_pull = jnp.where(
+            dynamic_separation,
+            jnp.array([0.3, jnp.where(is_upper, -0.4, 0.4)]),  # より強い剥離
+            jnp.zeros(2)
+        )
+        
+        vortex_pull = lax.cond(
+            is_cylinder,
+            lambda _: cylinder_pull,
+            lambda _: square_pull,
+            None
         ) * enhanced_separation
         
         new_Lambda_F = jnp.where(
@@ -1007,7 +1054,7 @@ def physics_step_v62(state: ParticleState,
             new_Lambda_F
         )
         
-        # 剥離フラグ更新（動的版）
+        # 剥離フラグ更新
         is_separated = jnp.where(
             enhanced_separation > 0.2,
             True,
@@ -1061,7 +1108,15 @@ def physics_step_v62(state: ParticleState,
             state.emergence[i]
         )
         
-        dist_to_obstacle = jnp.linalg.norm(pos - obstacle_center) - config.obstacle_size
+        # 障害物からの距離（形状別）
+        if is_cylinder:
+            dist_to_obstacle = particle_r - config.obstacle_size
+        else:
+            # 角柱の場合
+            dist_x = jnp.maximum(0, jnp.abs(particle_dx) - config.obstacle_size)
+            dist_y = jnp.maximum(0, jnp.abs(particle_dy) - config.obstacle_size)
+            dist_to_obstacle = jnp.sqrt(dist_x**2 + dist_y**2)
+        
         near_wall = (dist_to_obstacle > 0) & (dist_to_obstacle < 5.0)
         
         return (
@@ -1087,7 +1142,7 @@ def physics_step_v62(state: ParticleState,
     # 全粒子を並列更新
     results = vmap(update_particle)(jnp.arange(N))
     
-    # 結果を展開（変更なし）
+    # 結果を展開
     new_Lambda_F = results[0]
     new_Lambda_FF = results[1]
     new_prev_Lambda_F = results[2]
