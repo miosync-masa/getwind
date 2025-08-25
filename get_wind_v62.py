@@ -358,7 +358,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     
     # 🔧 相互作用範囲を拡大！（渦の結合のため）
     near_range = neighbor_mask & (distances < 15.0)   # 近距離
-    far_range = neighbor_mask & (distances < 20.0)    # 遠距離（渦結合用）
+    far_range = neighbor_mask & (distances < 22.0)    # 遠距離（渦結合用）
     
     # === 1. テンション密度の勾配による力（変更なし） ===
     drho = neighbor_rho_T - rho_T_i
@@ -427,7 +427,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
         # 引力の方向
         direction = dr[idx] / r
         
-        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.08, jnp.zeros(2))
+        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.10, jnp.zeros(2))
     
     vortex_merging = jnp.sum(
         vmap(compute_vortex_merging)(jnp.arange(len(neighbor_positions))),
@@ -753,8 +753,8 @@ def compute_dynamic_separation_angle(state: ParticleState, config: GETWindConfig
     base_angle = jnp.pi/2  # 90度
     max_shift = jnp.pi/6   # 最大30度シフト
     
-    upper_shift = jnp.tanh(upper_vorticity_sum / 50.0) * max_shift
-    lower_shift = jnp.tanh(lower_vorticity_sum / 50.0) * max_shift
+    upper_shift = jnp.tanh(upper_vorticity_sum / 75.0) * max_shift
+    lower_shift = jnp.tanh(lower_vorticity_sum / 75.0) * max_shift
     
     # 最終的な剥離角度（80〜120度の範囲）
     upper_sep_angle = jnp.clip(base_angle + upper_shift, jnp.pi*4/9, jnp.pi*2/3)
