@@ -357,7 +357,7 @@ def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
     distance_from_obstacle_x = pos_i[0] - config.obstacle_center_x
     
     # 障害物の影響圏内かチェック（直径の2.5倍 = 100単位）
-    in_influence_zone = distance_from_obstacle_x < 100.0
+    in_influence_zone = distance_from_obstacle_x < 130.0
     
     # 影響圏外なら相互作用なし
     zero_force = jnp.zeros(2)
