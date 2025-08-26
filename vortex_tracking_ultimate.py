@@ -235,78 +235,176 @@ def compute_effective_reynolds(states, config, n_samples=100):
     else:
         return 200.0, config.viscosity_factor * 0.05  # デフォルト
 
-def compute_lift_coefficient_ultimate(state, config):
-    """Ultimate版：幾何重み付き揚力係数"""
+def estimate_Ueff(states, config, x_probe=None, n_samples=64):
+    """実効流速U_effを推定（上流プローブ）"""
+    if x_probe is None:
+        x_probe = config.obstacle_center_x - 5.0 * (2*config.obstacle_size)
     
-    # stateが辞書の場合の処理
-    if isinstance(state, dict):
-        position = state['position']
-        Lambda_F = state['Lambda_F']
-        is_active = state['is_active']
-    else:
-        position = state.position
-        Lambda_F = state.Lambda_F
-        is_active = state.is_active
+    # プローブ位置がドメイン内か確認
+    if x_probe < 10:
+        x_probe = 10
     
-    # 障害物表面近傍の粒子を選択
-    dx = position[:, 0] - config.obstacle_center_x
-    dy = position[:, 1] - config.obstacle_center_y
-    r = np.sqrt(dx**2 + dy**2)
-    
-    # 表面近傍（1.0-2.0倍の半径）
-    near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 2.0) & is_active
-    
-    if np.sum(near_surface) < 10:
-        return 0.0
-    
-    # 極座標での角度
-    theta = np.arctan2(dy[near_surface], dx[near_surface])
-    r_near = r[near_surface]
-    
-    # 速度の大きさから圧力係数を計算（ベルヌーイの定理）
-    velocity_mag = np.linalg.norm(Lambda_F[near_surface], axis=1)
-    Cp = 1.0 - (velocity_mag / config.Lambda_F_inlet)**2
-    
-    # 幾何重み（半径方向の線素）
-    w = r_near / np.mean(r_near)  # 正規化された半径重み
-    
-    # 上半分と下半分で別々に積分
-    upper_mask = theta > 0
-    lower_mask = theta <= 0
-    
-    # 各領域での重み付き圧力積分
-    if np.any(upper_mask):
-        upper_contribution = np.average(
-            Cp[upper_mask] * np.sin(theta[upper_mask]), 
-            weights=w[upper_mask]
-        )
-    else:
-        upper_contribution = 0.0
+    vals = []
+    for st in states[1000:]:  # 過渡除外
+        pos = st['position'] if isinstance(st, dict) else st.position
+        vel = st['Lambda_F'] if isinstance(st, dict) else st.Lambda_F
+        act = st['is_active'] if isinstance(st, dict) else st.is_active
         
-    if np.any(lower_mask):
-        lower_contribution = np.average(
-            Cp[lower_mask] * np.sin(theta[lower_mask]), 
-            weights=w[lower_mask]
-        )
+        # x_probe付近の薄帯での流速
+        mask = act & (np.abs(pos[:,0] - x_probe) < 1.0)
+        if np.any(mask):
+            vals.append(np.mean(vel[mask, 0]))  # x方向流速の平均
+    
+    return float(np.mean(vals)) if vals else config.Lambda_F_inlet
+
+def lift_coefficient_ring_binned(state, config, n_bins=64):
+    """等角ビンCL計算（粒子バイアス除去）"""
+    pos = state['position'] if isinstance(state, dict) else state.position
+    vel = state['Lambda_F'] if isinstance(state, dict) else state.Lambda_F
+    act = state['is_active'] if isinstance(state, dict) else state.is_active
+
+    dx = pos[:,0] - config.obstacle_center_x
+    dy = pos[:,1] - config.obstacle_center_y
+    r = np.sqrt(dx*dx + dy*dy)
+    theta = np.arctan2(dy, dx)
+
+    # より薄いリング（1.0-1.3倍）
+    ring = (r > config.obstacle_size*1.00) & (r < config.obstacle_size*1.30) & act
+    if np.sum(ring) < 32:
+        return 0.0
+
+    vel_mag = np.linalg.norm(vel[ring], axis=1)
+    Cp = 1.0 - (vel_mag / config.Lambda_F_inlet)**2
+
+    th = theta[ring]
+    bins = np.linspace(-np.pi, np.pi, n_bins+1)
+    idx = np.digitize(th, bins) - 1
+    
+    CL_up = []
+    CL_lo = []
+
+    for k in range(n_bins):
+        m = (idx == k)
+        if not np.any(m):
+            continue
+        
+        thk = th[m]
+        Cpk = Cp[m]
+        rep = np.median(Cpk)    # 代表値（中央値）
+        thm = np.median(thk)     # ビン中心角度
+        term = rep * np.sin(thm)
+        
+        if thm > 0:
+            CL_up.append(term)
+        else:
+            CL_lo.append(term)
+
+    up = np.mean(CL_up) if CL_up else 0.0
+    lo = np.mean(CL_lo) if CL_lo else 0.0
+    return (up - lo) * 2.0
+
+def compute_lift_coefficient_ultimate(state, config, method='binned'):
+    """Ultimate版：揚力係数（等角ビンor重み付き）"""
+    
+    if method == 'binned':
+        return lift_coefficient_ring_binned(state, config)
     else:
-        lower_contribution = 0.0
+        # 従来の重み付き版（フォールバック）
+        # stateが辞書の場合の処理
+        if isinstance(state, dict):
+            position = state['position']
+            Lambda_F = state['Lambda_F']
+            is_active = state['is_active']
+        else:
+            position = state.position
+            Lambda_F = state.Lambda_F
+            is_active = state.is_active
+        
+        # 障害物表面近傍の粒子を選択
+        dx = position[:, 0] - config.obstacle_center_x
+        dy = position[:, 1] - config.obstacle_center_y
+        r = np.sqrt(dx**2 + dy**2)
+        
+        # 表面近傍（1.0-2.0倍の半径）
+        near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 2.0) & is_active
+        
+        if np.sum(near_surface) < 10:
+            return 0.0
+        
+        # 極座標での角度
+        theta = np.arctan2(dy[near_surface], dx[near_surface])
+        r_near = r[near_surface]
+        
+        # 速度の大きさから圧力係数を計算（ベルヌーイの定理）
+        velocity_mag = np.linalg.norm(Lambda_F[near_surface], axis=1)
+        Cp = 1.0 - (velocity_mag / config.Lambda_F_inlet)**2
+        
+        # 幾何重み（半径方向の線素）
+        w = r_near / np.mean(r_near)  # 正規化された半径重み
+        
+        # 上半分と下半分で別々に積分
+        upper_mask = theta > 0
+        lower_mask = theta <= 0
+        
+        # 各領域での重み付き圧力積分
+        if np.any(upper_mask):
+            upper_contribution = np.average(
+                Cp[upper_mask] * np.sin(theta[upper_mask]), 
+                weights=w[upper_mask]
+            )
+        else:
+            upper_contribution = 0.0
+            
+        if np.any(lower_mask):
+            lower_contribution = np.average(
+                Cp[lower_mask] * np.sin(theta[lower_mask]), 
+                weights=w[lower_mask]
+            )
+        else:
+            lower_contribution = 0.0
+        
+        # 揚力係数（上下の圧力差）
+        CL = (upper_contribution - lower_contribution) * 2.0
+        
+        return CL
+
+def refine_peak(freqs, power):
+    """ピークの放物線補間"""
+    k = np.argmax(power)
+    if 0 < k < len(power)-1:
+        y1, y2, y3 = power[k-1], power[k], power[k+1]
+        denom = (y1 - 2*y2 + y3)
+        if denom != 0:
+            delta = 0.5*(y1 - y3)/denom
+            return k + np.clip(delta, -0.5, 0.5)
+    return float(k)
+
+def estimate_f0_autocorr(sig, dt):
+    """自己相関によるピーク周波数初期推定"""
+    sig = sig - np.mean(sig)
+    ac = np.correlate(sig, sig, mode='full')[len(sig)-1:]
+    ac = ac / np.max(ac)
     
-    # 揚力係数（上下の圧力差）
-    CL = (upper_contribution - lower_contribution) * 2.0
+    # 最初の谷の後の最初の山を探す
+    from scipy.signal import find_peaks
+    peaks, _ = find_peaks(ac, distance=int(0.1/dt))
     
-    return CL
+    if len(peaks) > 1:
+        T = peaks[1] * dt
+        return 1.0/T
+    return None
 
 def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
     """Ultimate版：高速・高精度Strouhal数計算"""
     
     print("\n📊 Computing lift coefficient time series...")
     
-    # CLの時系列を計算
+    # CLの時系列を計算（等角ビン版）
     CL_history = []
     for i, state in enumerate(states):
         if i % 500 == 0:
             print(f"  Processing step {i}/{len(states)}")
-        CL = compute_lift_coefficient_ultimate(state, config)
+        CL = compute_lift_coefficient_ultimate(state, config, method='binned')
         CL_history.append(CL)
     
     # 初期の過渡応答を除去
@@ -321,6 +419,19 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
     
     # トレンド除去
     CL_signal = CL_signal - np.mean(CL_signal)
+    
+    # === U_effの推定 ===
+    print("\n  Estimating effective velocity U_eff...")
+    U_eff = estimate_Ueff(states, config)
+    print(f"  U_eff = {U_eff:.3f} (inlet = {config.Lambda_F_inlet})")
+    
+    # === 自己相関による初期推定 ===
+    f0 = estimate_f0_autocorr(CL_signal, config.dt)
+    if f0 is None:
+        # ラフな初期推定
+        D = 2 * config.obstacle_size
+        f0 = 0.2 * U_eff / D  # St≈0.2の仮定
+    print(f"  Initial frequency estimate: {f0:.4f} Hz")
     
     if method == 'rfft':
         # === rFFT法（高速） ===
@@ -346,24 +457,25 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
     else:
         raise ValueError(f"Unknown method: {method}")
     
-    # 物理的に妥当な範囲でピーク探索
-    valid_range = (freqs > 0.01) & (freqs < 0.2)
+    # === 狭窓でのピーク探索 ===
+    fmin, fmax = 0.7*f0, 1.3*f0
+    valid_range = (freqs > fmin) & (freqs < fmax)
     
     if np.any(valid_range):
         valid_freqs = freqs[valid_range]
         valid_power = power[valid_range]
         
-        # 最大ピークを検出
-        peak_idx = np.argmax(valid_power)
-        peak_freq = valid_freqs[peak_idx]
+        # 放物線補間でサブビン精度
+        kref = refine_peak(valid_freqs, valid_power)
+        peak_freq = np.interp(kref, np.arange(len(valid_freqs)), valid_freqs)
         
         # カルマン渦の周波数補正
         # CL（揚力）はshedding周波数f_sで振動 → 補正は不要
         frequency_correction = 1.0
         
-        # Strouhal数を計算
+        # Strouhal数を計算（U_eff使用！）
         D = 2 * config.obstacle_size
-        St_raw = peak_freq * D / config.Lambda_F_inlet
+        St_raw = peak_freq * D / U_eff  # ←ここが重要！
         St_corrected = St_raw * frequency_correction
         
         # 実効Reynolds数の推定
@@ -371,7 +483,8 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
         
         if debug:
             print(f"\n✨ Ultimate Lift Coefficient Analysis:")
-            print(f"  Peak frequency: {peak_freq:.4f} Hz")
+            print(f"  Peak frequency: {peak_freq:.4f} Hz (refined)")
+            print(f"  U_eff: {U_eff:.3f} (vs inlet: {config.Lambda_F_inlet})")
             print(f"  Raw Strouhal: {St_raw:.4f}")
             print(f"  Corrected Strouhal: {St_corrected:.4f}")
             print(f"  Effective Reynolds: {Re_eff:.1f}")
@@ -410,6 +523,7 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
             ax.plot(freqs[mask], power[mask])
             ax.axvline(peak_freq, color='red', linestyle='--', 
                       label=f'Peak: {peak_freq:.4f} Hz')
+            ax.axvspan(fmin, fmax, alpha=0.2, color='yellow', label='Search window')
             ax.set_xlabel('Frequency [Hz]')
             ax.set_ylabel('Power')
             ax.set_title(f'Power Spectrum ({method.upper()})')
@@ -421,8 +535,9 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
             ax.semilogy(freqs[mask], power[mask])
             ax.axvline(peak_freq, color='red', linestyle='--', 
                       label=f'Peak: {peak_freq:.4f} Hz')
-            ax.axvline(0.0487, color='green', linestyle=':', 
-                      label='Expected (St=0.195)')
+            expected_f = 0.195 * U_eff / D
+            ax.axvline(expected_f, color='green', linestyle=':', 
+                      label=f'Expected (St=0.195): {expected_f:.4f} Hz')
             ax.set_xlabel('Frequency [Hz]')
             ax.set_ylabel('Power (log scale)')
             ax.set_title('Power Spectrum (Log Scale)')
@@ -442,14 +557,18 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
             ax.legend()
             ax.grid(True, alpha=0.3)
             
-            # 6. FFT解像度の確認
+            # 6. FFT解像度とU_eff情報
             ax = axes[1, 2]
             df = freqs[1] - freqs[0] if len(freqs) > 1 else 0
             resolution_info = f"Frequency resolution: {df:.5f} Hz\n"
             resolution_info += f"Nyquist frequency: {0.5/config.dt:.2f} Hz\n"
             resolution_info += f"Signal length: {len(CL_signal)} samples\n"
             resolution_info += f"Time span: {len(CL_signal)*config.dt:.1f} s\n"
-            resolution_info += f"Method: {method.upper()}"
+            resolution_info += f"Method: {method.upper()}\n"
+            resolution_info += f"─────────────────\n"
+            resolution_info += f"U_eff: {U_eff:.3f} m/s\n"
+            resolution_info += f"U_inlet: {config.Lambda_F_inlet:.1f} m/s\n"
+            resolution_info += f"Reduction: {(1-U_eff/config.Lambda_F_inlet)*100:.1f}%"
             ax.text(0.1, 0.5, resolution_info, transform=ax.transAxes,
                    fontsize=11, verticalalignment='center',
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -462,7 +581,7 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
         
         return St_corrected
     else:
-        print("Warning: No valid peak found in spectrum")
+        print(f"Warning: No valid peak found in range [{fmin:.4f}, {fmax:.4f}] Hz")
         return 0.0
 
 # ==============================
