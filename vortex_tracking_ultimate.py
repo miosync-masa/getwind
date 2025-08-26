@@ -412,11 +412,41 @@ def estimate_f0_autocorr(sig, dt):
     return None
 
 def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
-    """Ultimate版：高速・高精度Strouhal数計算"""
+    """Ultimate版：物理単位で正しく計算するStrouhal数解析
+    
+    Args:
+        states: シミュレーション状態のリスト
+        config: シミュレーション設定
+        debug: デバッグプロット出力フラグ
+        method: FFT手法 ('rfft' or 'welch')
+    
+    Returns:
+        float: 計算されたStrouhal数
+    """
     
     print("\n📊 Computing lift coefficient time series...")
     
-    # CLの時系列を計算（等角ビン版）
+    # === 物理スケール変換の初期化 ===
+    if hasattr(config, 'scale_m_per_unit'):
+        L_scale = config.scale_m_per_unit
+        T_scale = config.scale_s_per_step if hasattr(config, 'scale_s_per_step') else 1.0
+    else:
+        # フォールバック（旧バージョン互換性のため）
+        L_scale = 0.001  # デフォルト: 1 grid unit = 1mm
+        T_scale = 0.01   # デフォルト: 1 step = 0.01s
+        print(f"⚠ Using default scales: L={L_scale}m/unit, T={T_scale}s/step")
+    
+    # 物理量への変換
+    D_physical = 2 * config.obstacle_size * L_scale  # [m]
+    dt_physical = config.dt * T_scale               # [s]
+    
+    print(f"\n📏 Physical scales:")
+    print(f"  Length scale (m/unit): {L_scale:.6f}")
+    print(f"  Time scale (s/step): {T_scale:.6f}")
+    print(f"  Obstacle diameter: {D_physical:.4f} m ({D_physical*1000:.1f} mm)")
+    print(f"  Time step: {dt_physical:.4f} s")
+    
+    # === CLの時系列を計算（等角ビン版） ===
     CL_history = []
     for i, state in enumerate(states):
         if i % 500 == 0:
@@ -431,27 +461,33 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
         print("Warning: Not enough data for accurate FFT")
         return 0.0
     
-    # 時間軸（物理単位）
-    time = np.arange(len(CL_signal)) * config.dt
+    # 物理時間軸 [s]
+    time_physical = np.arange(len(CL_signal)) * dt_physical
     
     # トレンド除去
     CL_signal = CL_signal - np.mean(CL_signal)
     
-    # === U_effの推定 ===
+    # === U_effの推定（物理単位変換付き） ===
     print("\n  Estimating effective velocity U_eff...")
-    U_eff = estimate_Ueff(states, config)
-    print(f"  U_eff = {U_eff:.3f} (inlet = {config.Lambda_F_inlet})")
+    U_eff_grid = estimate_Ueff(states, config)  # グリッド単位 [unit/step]
+    U_eff_physical = U_eff_grid * L_scale / T_scale  # 物理単位 [m/s]
+    U_inlet_physical = config.Lambda_F_inlet * L_scale / T_scale  # 入口速度 [m/s]
     
-    # === 自己相関による初期推定 ===
-    f0 = estimate_f0_autocorr(CL_signal, config.dt)
+    print(f"  U_eff (grid): {U_eff_grid:.3f} unit/step")
+    print(f"  U_eff (physical): {U_eff_physical:.3f} m/s")
+    print(f"  U_inlet (physical): {U_inlet_physical:.3f} m/s")
+    print(f"  Velocity reduction: {(1-U_eff_physical/U_inlet_physical)*100:.1f}%")
+    
+    # === 自己相関による初期周波数推定 ===
+    f0 = estimate_f0_autocorr(CL_signal, dt_physical)
     if f0 is None:
-        # ラフな初期推定
-        D = 2 * config.obstacle_size
-        f0 = 0.2 * U_eff / D  # St≈0.2の仮定
+        # ラフな初期推定（St≈0.2の仮定）
+        f0 = 0.2 * U_eff_physical / D_physical
     print(f"  Initial frequency estimate: {f0:.4f} Hz")
     
+    # === FFT解析 ===
     if method == 'rfft':
-        # === rFFT法（高速） ===
+        # rFFT法（高速）
         window = np.hanning(len(CL_signal))
         CL_windowed = CL_signal * window
         
@@ -460,14 +496,14 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
         
         # 実数FFT
         fft = np.fft.rfft(CL_windowed, n=n_padded)
-        freqs = np.fft.rfftfreq(n_padded, d=config.dt)
+        freqs = np.fft.rfftfreq(n_padded, d=dt_physical)  # 物理周波数 [Hz]
         power = np.abs(fft)**2
         
     elif method == 'welch':
-        # === Welch法（ノイズに強い） ===
+        # Welch法（ノイズに強い）
         nperseg = min(4096, len(CL_signal))
         freqs, power = welch(CL_signal, 
-                           fs=1.0/config.dt, 
+                           fs=1.0/dt_physical,  # サンプリング周波数 [Hz]
                            window='hann',
                            nperseg=nperseg,
                            noverlap=nperseg//2)
@@ -486,41 +522,45 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
         kref = refine_peak(valid_freqs, valid_power)
         peak_freq = np.interp(kref, np.arange(len(valid_freqs)), valid_freqs)
         
-        # カルマン渦の周波数補正
-        # CL（揚力）はshedding周波数f_sで振動 → 補正は不要
-        frequency_correction = 1.0
+        # === Strouhal数の計算（物理単位） ===
+        St = peak_freq * D_physical / U_eff_physical
         
-        # Strouhal数を計算（U_eff使用！）
-        D = 2 * config.obstacle_size
-        St_raw = peak_freq * D / U_eff  # ←ここが重要！
-        St_corrected = St_raw * frequency_correction
+        # === Reynolds数の計算（物理単位） ===
+        nu_air = 1.5e-5  # 空気の動粘性係数 [m²/s] @ 20°C
+        Re_physical = U_eff_physical * D_physical / nu_air
         
-        # 実効Reynolds数の推定
+        # 実効Reynolds数の推定（オプション）
         Re_eff, nu_eff = compute_effective_reynolds(states, config)
         
         if debug:
-            print(f"\n✨ Ultimate Lift Coefficient Analysis:")
-            print(f"  Peak frequency: {peak_freq:.4f} Hz (refined)")
-            print(f"  U_eff: {U_eff:.3f} (vs inlet: {config.Lambda_F_inlet})")
-            print(f"  Raw Strouhal: {St_raw:.4f}")
-            print(f"  Corrected Strouhal: {St_corrected:.4f}")
-            print(f"  Effective Reynolds: {Re_eff:.1f}")
+            print(f"\n✨ Ultimate Physical Analysis:")
+            print(f"  === Frequency Analysis ===")
+            print(f"  Peak frequency: {peak_freq:.4f} Hz")
+            print(f"  Expected freq (St=0.195): {0.195*U_eff_physical/D_physical:.4f} Hz")
+            print(f"  === Physical Parameters ===")
+            print(f"  D (physical): {D_physical:.4f} m ({D_physical*1000:.1f} mm)")
+            print(f"  U_eff (physical): {U_eff_physical:.3f} m/s")
+            print(f"  Reynolds (physical): {Re_physical:.0f}")
+            print(f"  === Strouhal Number ===")
+            print(f"  Computed St: {St:.4f}")
             print(f"  Target St (Re=200): 0.195")
-            print(f"  Error: {abs(St_corrected - 0.195)/0.195*100:.1f}%")
+            print(f"  Error: {abs(St - 0.195)/0.195*100:.1f}%")
             
             # ブロッケージ比の確認
-            blockage = D / 150.0  # 直径/ドメイン高さ
+            domain_height_physical = config.domain_height * L_scale
+            blockage = D_physical / domain_height_physical
+            print(f"  === Flow Conditions ===")
             print(f"  Blockage ratio: {blockage:.3f}")
             if blockage > 0.2:
                 print(f"  ⚠ High blockage may affect St by ~{(blockage-0.2)*10:.1f}%")
             
-            # 詳細なプロット
+            # === 詳細なプロット ===
             fig, axes = plt.subplots(2, 3, figsize=(16, 10))
             
-            # 1. 元の時系列（時間軸）
+            # 1. 元の時系列（物理時間軸）
             ax = axes[0, 0]
-            time_full = np.arange(len(CL_history)) * config.dt
-            ax.plot(time_full, CL_history, linewidth=0.5)
+            time_full_physical = np.arange(len(CL_history)) * dt_physical
+            ax.plot(time_full_physical, CL_history, linewidth=0.5)
             ax.set_xlabel('Time [s]')
             ax.set_ylabel('CL')
             ax.set_title('Raw Lift Coefficient Time Series')
@@ -528,7 +568,7 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
             
             # 2. 処理後の信号
             ax = axes[0, 1]
-            ax.plot(time, CL_signal, linewidth=0.5)
+            ax.plot(time_physical, CL_signal, linewidth=0.5)
             ax.set_xlabel('Time [s]')
             ax.set_ylabel('CL (detrended)')
             ax.set_title('Processed Signal (after removing initial transient)')
@@ -536,7 +576,7 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
             
             # 3. パワースペクトル（線形スケール）
             ax = axes[0, 2]
-            mask = freqs < 0.5
+            mask = freqs < 2.0  # 2Hz以下を表示
             ax.plot(freqs[mask], power[mask])
             ax.axvline(peak_freq, color='red', linestyle='--', 
                       label=f'Peak: {peak_freq:.4f} Hz')
@@ -552,7 +592,7 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
             ax.semilogy(freqs[mask], power[mask])
             ax.axvline(peak_freq, color='red', linestyle='--', 
                       label=f'Peak: {peak_freq:.4f} Hz')
-            expected_f = 0.195 * U_eff / D
+            expected_f = 0.195 * U_eff_physical / D_physical
             ax.axvline(expected_f, color='green', linestyle=':', 
                       label=f'Expected (St=0.195): {expected_f:.4f} Hz')
             ax.set_xlabel('Frequency [Hz]')
@@ -564,39 +604,50 @@ def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
             # 5. Strouhal vs Reynolds
             ax = axes[1, 1]
             Re_range = np.array([100, 150, 200, 250, 300])
-            St_empirical = 0.195 * np.ones_like(Re_range)  # Re=200付近では一定
-            ax.plot(Re_range, St_empirical, 'g-', label='Empirical')
-            ax.scatter([Re_eff], [St_corrected], color='red', s=100, 
-                      zorder=5, label=f'Simulation (Re={Re_eff:.0f})')
+            St_empirical = 0.195 * np.ones_like(Re_range)
+            ax.plot(Re_range, St_empirical, 'g-', label='Empirical (cylinder)')
+            ax.scatter([Re_physical], [St], color='red', s=100, 
+                      zorder=5, label=f'Simulation (Re={Re_physical:.0f})')
             ax.set_xlabel('Reynolds Number')
             ax.set_ylabel('Strouhal Number')
             ax.set_title('St vs Re Comparison')
+            ax.set_xlim(50, 350)
+            ax.set_ylim(0.1, 0.3)
             ax.legend()
             ax.grid(True, alpha=0.3)
             
-            # 6. FFT解像度とU_eff情報
+            # 6. 物理パラメータサマリー
             ax = axes[1, 2]
-            df = freqs[1] - freqs[0] if len(freqs) > 1 else 0
-            resolution_info = f"Frequency resolution: {df:.5f} Hz\n"
-            resolution_info += f"Nyquist frequency: {0.5/config.dt:.2f} Hz\n"
-            resolution_info += f"Signal length: {len(CL_signal)} samples\n"
-            resolution_info += f"Time span: {len(CL_signal)*config.dt:.1f} s\n"
-            resolution_info += f"Method: {method.upper()}\n"
-            resolution_info += f"─────────────────\n"
-            resolution_info += f"U_eff: {U_eff:.3f} m/s\n"
-            resolution_info += f"U_inlet: {config.Lambda_F_inlet:.1f} m/s\n"
-            resolution_info += f"Reduction: {(1-U_eff/config.Lambda_F_inlet)*100:.1f}%"
-            ax.text(0.1, 0.5, resolution_info, transform=ax.transAxes,
-                   fontsize=11, verticalalignment='center',
-                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            ax.axis('off')
-            ax.set_title('Analysis Parameters')
+            summary_text = "=== PHYSICAL PARAMETERS ===\n"
+            summary_text += f"Length scale: {L_scale*1000:.3f} mm/unit\n"
+            summary_text += f"Time scale: {T_scale*1000:.1f} ms/step\n"
+            summary_text += f"─────────────────\n"
+            summary_text += f"Cylinder diameter: {D_physical*1000:.1f} mm\n"
+            summary_text += f"Domain height: {domain_height_physical*1000:.0f} mm\n"
+            summary_text += f"Blockage: {blockage:.1%}\n"
+            summary_text += f"─────────────────\n"
+            summary_text += f"U_eff: {U_eff_physical:.3f} m/s\n"
+            summary_text += f"U_inlet: {U_inlet_physical:.3f} m/s\n"
+            summary_text += f"Reynolds: {Re_physical:.0f}\n"
+            summary_text += f"─────────────────\n"
+            summary_text += f"Shedding freq: {peak_freq:.3f} Hz\n"
+            summary_text += f"Shedding period: {1/peak_freq:.3f} s\n"
+            summary_text += f"Strouhal: {St:.4f}\n"
+            summary_text += f"Error from 0.195: {(St-0.195)/0.195*100:+.1f}%"
             
+            ax.text(0.1, 0.5, summary_text, transform=ax.transAxes,
+                   fontsize=10, verticalalignment='center', family='monospace',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            ax.axis('off')
+            ax.set_title('Physical Analysis Summary')
+            
+            plt.suptitle(f'GET Wind™ Strouhal Analysis (Physical Units)', fontsize=14, y=1.02)
             plt.tight_layout()
-            plt.savefig('lift_analysis_ultimate.png', dpi=150)
-            print(f"  Plot saved to 'lift_analysis_ultimate.png'")
+            plt.savefig('strouhal_analysis_physical.png', dpi=150, bbox_inches='tight')
+            print(f"\n  📊 Plot saved to 'strouhal_analysis_physical.png'")
         
-        return St_corrected
+        return St
+        
     else:
         print(f"Warning: No valid peak found in range [{fmin:.4f}, {fmax:.4f}] Hz")
         return 0.0
