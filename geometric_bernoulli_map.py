@@ -37,7 +37,7 @@ class FlowConfig:
 
 @dataclass
 class GridConfig:
-    """計算グリッド設定"""
+    """計算グリッド設定（物理単位対応版）"""
     nx: int = 300
     ny: int = 150
     x_min: float = 0.0
@@ -45,13 +45,19 @@ class GridConfig:
     y_min: float = 0.0
     y_max: float = 150.0
     
-    @property
-    def dx(self) -> float:
-        return (self.x_max - self.x_min) / self.nx
+    # ✨ NEW: 物理スケーリング
+    scale_m_per_unit: float = 0.001  # 1グリッド単位 = 1mm
+    scale_s_per_step: float = 0.01   # 1ステップ = 0.01秒
     
     @property
-    def dy(self) -> float:
-        return (self.y_max - self.y_min) / self.ny
+    def physical_width(self) -> float:
+        """物理的な幅 [m]"""
+        return (self.x_max - self.x_min) * self.scale_m_per_unit
+    
+    @property
+    def physical_height(self) -> float:
+        """物理的な高さ [m]"""
+        return (self.y_max - self.y_min) * self.scale_m_per_unit
 
 # ==============================
 # Geometric Bernoulli Field Calculator
