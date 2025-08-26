@@ -76,8 +76,8 @@ class GETWindConfig(NamedTuple):
     vortex_grid_size: float = 10.0
     
     # 幾何MAP用パラメータ
-    shear_instability_strength: float = 0.5   # せん断層不安定性
-    vortex_formation_noise: float = 1.0       # 渦形成領域の乱流強度
+    shear_instability_strength: float = 0.8   # せん断層不安定性
+    vortex_formation_noise: float = 1.2       # 渦形成領域の乱流強度
     wake_turbulence_factor: float = 0.8       # 後流乱流係数
     
     # 粒子パラメータ
