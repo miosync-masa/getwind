@@ -94,6 +94,9 @@ class MapData:
         self.vorticity_potential = jnp.array(data['vorticity_potential'])
         self.wake_region = jnp.array(data['wake_region'])
         
+        # 🆕 追加フィールド
+        self.boundary_layer = jnp.array(data['boundary_layer'])
+        
         # 速度場（参考用）
         self.velocity_u = jnp.array(data['velocity_u'])
         self.velocity_v = jnp.array(data['velocity_v'])
@@ -102,6 +105,9 @@ class MapData:
         self.nx, self.ny = self.density.shape
         
         print(f"Map loaded: {self.nx}x{self.ny} grid")
+        print(f"  Available fields: density, pressure, separation,")
+        print(f"                   vorticity_potential, wake_region,") 
+        print(f"                   boundary_layer, velocity_u, velocity_v")
 
 # ==============================
 # Particle State（Λ³ Enhanced）
@@ -819,6 +825,8 @@ def physics_step_v62(state: ParticleState,
                     separation_map: jnp.ndarray,
                     velocity_u_map: jnp.ndarray,
                     velocity_v_map: jnp.ndarray,
+                    vorticity_potential_map: jnp.ndarray,  # 追加
+                    wake_region_map: jnp.ndarray,  # 追加
                     map_nx: int, map_ny: int,
                     config: GETWindConfig,
                     key: random.PRNGKey) -> ParticleState:
@@ -1019,39 +1027,32 @@ def physics_step_v62(state: ParticleState,
             new_Lambda_F_base
         )
         
-        # === 🆕 剥離領域での処理（形状別）===
+        # === 剥離領域での処理：MAP活用版 ===
+        # 渦度ポテンシャルと後流も読み込む
+        local_vorticity_pot = bilinear_interpolate(vorticity_map, grid_x, grid_y, map_nx, map_ny)
+        local_wake = bilinear_interpolate(wake_map, grid_x, grid_y, map_nx, map_ny)
+        
+        # MAPベースの剥離強度（形状別処理不要）
+        separation_strength = jnp.maximum(
+            local_separation,
+            local_vorticity_pot * 0.5
+        )
+        
+        # 剥離時のノイズと偏向力
         sep_key = random.fold_in(key, i * 2000)
-        # 剥離の強さに応じたノイズ（強化版を使用）
-        sep_noise = random.normal(sep_key, (2,)) * enhanced_separation
+        sep_noise = random.normal(sep_key, (2,)) * separation_strength
         
-        # 🆕 剥離時の速度偏向（形状によって異なる）
-        # 円柱：渦に引っ張られる方向
-        cylinder_pull = jnp.where(
-            dynamic_separation & is_upper,
-            jnp.array([0.2, -0.3]),  # 上側は後方下向き
-            jnp.where(
-                dynamic_separation & ~is_upper,
-                jnp.array([0.2, 0.3]),   # 下側は後方上向き
-                jnp.zeros(2)
-            )
-        )
+        # 剥離方向はMAPの速度場から自然に決まる
+        velocity_deviation = jnp.array([
+            expected_u - state.Lambda_F[i, 0],
+            expected_v - state.Lambda_F[i, 1]
+        ])
         
-        # 角柱：エッジから強く剥離
-        square_pull = jnp.where(
-            dynamic_separation,
-            jnp.array([0.5, jnp.where(is_upper, -0.8, 0.8)]),  # 2倍に！
-            jnp.zeros(2)
-        )
-                
-        vortex_pull = lax.cond(
-            is_cylinder,
-            lambda _: cylinder_pull,
-            lambda _: square_pull,
-            None
-        ) * enhanced_separation
+        # 後流では偏向を強化
+        vortex_pull = velocity_deviation * separation_strength * (1.0 + local_wake)
         
         new_Lambda_F = jnp.where(
-            enhanced_separation > 0.2,
+            separation_strength > 0.2,
             new_Lambda_F + sep_noise + vortex_pull,
             new_Lambda_F
         )
@@ -1378,6 +1379,8 @@ def run_simulation_v62(map_file: str, config: GETWindConfig, seed: int = 42, sav
         map_data.separation,
         map_data.velocity_u,
         map_data.velocity_v,
+        map_data.vorticity_potential,  # 追加
+        map_data.wake_region,  # 追加
         map_data.nx,
         map_data.ny,
         config,
