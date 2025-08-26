@@ -1057,9 +1057,9 @@ def physics_step_v62(state: ParticleState,
             new_Lambda_F
         )
         
-        # 剥離フラグ更新
+        # 剥離フラグ更新（修正版）
         is_separated = jnp.where(
-            enhanced_separation > 0.2,
+            separation_strength > 0.2,  # ← MAP活用版の変数
             True,
             state.is_separated[i]
         )
