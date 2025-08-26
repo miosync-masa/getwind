@@ -51,7 +51,7 @@ class GETWindConfig(NamedTuple):
     thermal_alpha: float = 0.008      # 温度勾配の重み
     density_beta: float = 0.015       # 密度勾配の重み
     structure_coupling: float = 0.025  # 構造結合強度
-    viscosity_factor: float = 0.1      # 粘性係数
+    viscosity_factor: float = 40.0     # 粘性係数
     interaction_strength: float = 0.1  # 粒子間相互作用強度
     
     # 効率パラメータ
