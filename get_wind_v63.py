@@ -1078,7 +1078,7 @@ def run_simulation_v63(map_file: str, config: GETWindConfig,
         )
         
         # 状態保存
-        if save_states and (step % 10 == 0 or step == config.n_steps - 1):
+        if save_states:
             state_history.append({
                 'position': np.array(state.position),
                 'Lambda_F': np.array(state.Lambda_F),
