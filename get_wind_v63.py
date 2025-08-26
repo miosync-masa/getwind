@@ -745,26 +745,31 @@ def physics_step_v63(state: ParticleState,
             new_Lambda_F_base
         )
         
-        # === 6. 幾何情報による物理現象の誘発 ===
+        # === 6. 幾何情報から物理パラメータを再計算 ===
+        # せん断層の強度から局所Reynolds数を修正
+        # せん断が強い = 局所的に粘性が効きにくい
+        local_Re_factor = 1.0 + local_shear  # shearが1なら局所Re2倍
+        local_viscosity = config.viscosity_factor / local_Re_factor
         
-        # 渦形成領域での乱流生成
-        vortex_key = random.fold_in(key, i * 2000)
-        vortex_turbulence = random.normal(vortex_key, (2,)) * local_vortex_formation * config.vortex_formation_noise
+        # 渦形成領域では速度勾配テンソルの影響を強める
+        # （構造相互作用の計算時に既に使われているLambda_coreを活用）
+        Lambda_core_weight = 1.0 + local_vortex_formation
         
-        # せん断層での不安定性
-        shear_key = random.fold_in(key, i * 3000)
-        shear_instability = random.normal(shear_key, (2,)) * local_shear * config.shear_instability_strength
+        # 後流では圧力回復を考慮
+        # wake_structureは0-1で正規化されているので、そのまま使える
+        pressure_recovery = 1.0 - local_wake * local_wake  # 二乗で減衰
         
-        # 後流での追加乱流
-        wake_key = random.fold_in(key, i * 4000)
-        wake_turbulence = random.normal(wake_key, (2,)) * local_wake * config.wake_turbulence_factor
+        # 剥離の影響は既存の勾配に含まれているので追加計算不要
+        # ただし剥離フラグは更新
+        is_separated = jnp.where(
+            local_separation > 0.5,
+            True,
+            state.is_separated[i]
+        )
         
-        # 剥離領域でのノイズ
-        sep_key = random.fold_in(key, i * 5000)
-        sep_noise = random.normal(sep_key, (2,)) * local_separation
-        
-        # 全ての幾何効果を合成
-        new_Lambda_F = new_Lambda_F + vortex_turbulence + shear_instability + wake_turbulence + sep_noise
+        # 物理的に一貫した力の計算
+        effective_grad_pressure = grad_pressure * pressure_recovery
+        new_Lambda_F = state.Lambda_F[i] - config.thermal_alpha * effective_grad_pressure - config.density_beta * grad_density + structure_force
         
         # 剥離フラグ更新
         is_separated = jnp.where(
