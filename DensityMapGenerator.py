@@ -1,42 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HIGH PRESSURE!!!™
-Density Map Generator for GET Wind™
-ベルヌーイの定理を使った密度場マップ生成器
+Geometric Bernoulli Map Generator for GET Wind™
+理想流体の幾何学的構造を持つ圧力・密度場生成器
 
-シンプルに、分かりやすく、実用的に！
-風洞実験の条件から各種場を事前計算します。
+物理的に正しい流線形状と圧力分布を生成し、
+粘性粒子法との美しい責務分担を実現！
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 import json
 
 # ==============================
-# Configuration
+# Configuration Classes
 # ==============================
 
 @dataclass
 class ObstacleConfig:
     """障害物の設定"""
-    shape_type: str  # 'cylinder', 'square', 'airfoil', 'none'
+    shape_type: str  # 'cylinder', 'square', 'airfoil'
     center_x: float = 100.0
     center_y: float = 75.0
-    size: float = 20.0  # 特性長さ（円柱なら半径）
+    size: float = 20.0  # 特性長さ（円柱なら半径、角柱なら半幅）
     angle: float = 0.0  # 迎角[deg]
 
 @dataclass
 class FlowConfig:
-    """流れの条件（Re=200用）"""
+    """流れの条件"""
     U_inf: float = 10.0      # 一様流速度 [m/s]
     rho_inf: float = 1.225   # 基準密度 [kg/m³]
-    P_inf: float = 101325.0  # 基準圧力 [Pa]
-    T_inf: float = 293.0     # 温度 [K]
-    nu: float = 2.0          # 動粘性係数 [m²/s] ← Re=200になる！
+    Re: float = 200.0        # Reynolds数（形状特性の決定用）
 
 @dataclass
 class GridConfig:
@@ -57,11 +54,11 @@ class GridConfig:
         return (self.y_max - self.y_min) / self.ny
 
 # ==============================
-# Field Calculator (Bernoulli-based)
+# Geometric Bernoulli Field Calculator
 # ==============================
 
-class DensityFieldCalculator:
-    """ベルヌーイの定理による場の計算"""
+class GeometricBernoulliCalculator:
+    """幾何学的ベルヌーイ場の計算"""
     
     def __init__(self, obstacle: ObstacleConfig, flow: FlowConfig, grid: GridConfig):
         self.obstacle = obstacle
@@ -73,454 +70,518 @@ class DensityFieldCalculator:
         self.y = np.linspace(grid.y_min, grid.y_max, grid.ny)
         self.X, self.Y = np.meshgrid(self.x, self.y, indexing='ij')
         
-        # 気体定数
-        self.R = 287.0  # J/(kg·K)
+        # 形状別の物理パラメータ（Re=200での実験値）
+        self.physics_params = self._get_physics_params()
         
-    def calculate_all_fields(self) -> dict:
+    def _get_physics_params(self) -> Dict:
+        """形状別の物理パラメータ（実験値ベース）"""
+        if self.obstacle.shape_type == 'cylinder':
+            return {
+                'separation_angle': np.pi/2.2,  # 約82度
+                'wake_width_factor': 1.5,
+                'vortex_formation_length': 2.0,  # 直径の2倍後方
+                'strouhal_number': 0.195,
+                'base_pressure': -0.9,  # 背圧係数
+                'recovery_length': 10.0,  # 圧力回復長さ（直径単位）
+            }
+        elif self.obstacle.shape_type == 'square':
+            return {
+                'separation_angle': np.pi/2,  # 90度（エッジ）
+                'wake_width_factor': 2.2,
+                'vortex_formation_length': 1.5,
+                'strouhal_number': 0.14,
+                'base_pressure': -1.4,
+                'recovery_length': 15.0,
+            }
+        else:
+            raise ValueError(f"Unknown shape: {self.obstacle.shape_type}")
+    
+    def calculate_all_fields(self) -> Dict[str, np.ndarray]:
         """全ての場を計算"""
-        print("Calculating velocity field...")
-        u, v = self.calculate_velocity_field()
+        print(f"Calculating geometric fields for {self.obstacle.shape_type}...")
         
-        print("Calculating pressure field...")
-        pressure = self.calculate_pressure_field(u, v)
+        # 1. 流線関数と速度場
+        psi, u, v = self.calculate_stream_function()
         
-        print("Calculating density field...")
-        density = self.calculate_density_field(pressure)
+        # 2. 幾何学的圧力場
+        pressure = self.calculate_geometric_pressure(psi, u, v)
         
-        print("Calculating separation tendency...")
-        separation = self.calculate_separation_field(u, v)
+        # 3. 密度場（圧力から導出）
+        density = self.calculate_density_from_pressure(pressure)
         
-        print("Calculating vorticity potential...")
-        vorticity = self.calculate_vorticity_potential(u, v)
+        # 4. 剥離領域
+        separation = self.calculate_separation_zones()
         
-        print("Calculating wake region...")
-        wake = self.calculate_wake_region()
+        # 5. 渦形成領域
+        vortex_formation = self.calculate_vortex_formation_zones()
         
-        print("Calculating boundary layer...")
-        boundary = self.calculate_boundary_layer()
+        # 6. 後流構造
+        wake_structure = self.calculate_wake_structure()
+        
+        # 7. せん断層
+        shear_layer = self.calculate_shear_layers()
         
         return {
+            'stream_function': psi,
             'velocity_u': u,
             'velocity_v': v,
             'pressure': pressure,
             'density': density,
             'separation': separation,
-            'vorticity_potential': vorticity,
-            'wake_region': wake,
-            'boundary_layer': boundary
+            'vortex_formation': vortex_formation,
+            'wake_structure': wake_structure,
+            'shear_layer': shear_layer
         }
     
-    def calculate_velocity_field(self) -> Tuple[np.ndarray, np.ndarray]:
-        """速度場の計算（ポテンシャル流）"""
-        u = np.ones_like(self.X) * self.flow.U_inf
-        v = np.zeros_like(self.Y)
+    def calculate_stream_function(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """流線関数と速度場の計算"""
+        cx, cy = self.obstacle.center_x, self.obstacle.center_y
+        R = self.obstacle.size
+        U = self.flow.U_inf
         
-        if self.obstacle.shape_type == 'none':
-            return u, v
-        
-        # 円柱の場合のポテンシャル流
         if self.obstacle.shape_type == 'cylinder':
-            # 相対位置
-            dx = self.X - self.obstacle.center_x
-            dy = self.Y - self.obstacle.center_y
+            # 円柱周りの流線関数
+            dx = self.X - cx
+            dy = self.Y - cy
             r = np.sqrt(dx**2 + dy**2)
             theta = np.arctan2(dy, dx)
             
-            # 円柱の外側のみ計算
-            R = self.obstacle.size
-            outside = r > R
+            # ψ = U∞r sin(θ)(1 - R²/r²)
+            psi = np.where(r > R,
+                          U * r * np.sin(theta) * (1 - (R/r)**2),
+                          0)
             
-            # ポテンシャル流の速度場
-            # u = U∞(1 - R²/r² cos(2θ))
-            # v = -U∞ R²/r² sin(2θ)
-            u_r = self.flow.U_inf * (1 - (R/r)**2) * np.cos(theta)
-            u_theta = -self.flow.U_inf * (1 + (R/r)**2) * np.sin(theta)
-            
-            # 直交座標に変換
-            u[outside] = u_r[outside] * np.cos(theta[outside]) - u_theta[outside] * np.sin(theta[outside])
-            v[outside] = u_r[outside] * np.sin(theta[outside]) + u_theta[outside] * np.cos(theta[outside])
-            
-            # 円柱内部は速度ゼロ
-            inside = r <= R
-            u[inside] = 0
-            v[inside] = 0
+            # 速度成分（流線関数から導出）
+            u = np.where(r > R,
+                        U * (1 - (R/r)**2 * np.cos(2*theta)),
+                        0)
+            v = np.where(r > R,
+                        -U * (R/r)**2 * np.sin(2*theta),
+                        0)
             
         elif self.obstacle.shape_type == 'square':
-            # 相対位置
-            dx = self.X - self.obstacle.center_x
-            dy = self.Y - self.obstacle.center_y
+            # 角柱（近似的な取り扱い）
+            dx = self.X - cx
+            dy = self.Y - cy
             
-            # 角柱内部
-            inside = (np.abs(dx) <= self.obstacle.size) & (np.abs(dy) <= self.obstacle.size)
+            # 角柱の外側判定
+            outside = (np.abs(dx) > R) | (np.abs(dy) > R)
             
-            # 角柱外部のポテンシャル流（近似解）
-            # 角からの距離
-            corner_dist = np.sqrt((np.abs(dx) - self.obstacle.size)**2 + 
-                                 (np.abs(dy) - self.obstacle.size)**2)
+            # Schwarz-Christoffel変換の近似
+            psi = np.zeros_like(self.X)
+            u = np.ones_like(self.X) * U
+            v = np.zeros_like(self.Y)
             
-            # 流れの偏向
-            deflection_x = np.where(np.abs(dx) > self.obstacle.size,
-                                    1.0 - (self.obstacle.size**2 / (dx**2 + 1e-8)),
-                                    0.0)
-            deflection_y = np.where(np.abs(dy) > self.obstacle.size,
-                                    1.0 - (self.obstacle.size**2 / (dy**2 + 1e-8)),
-                                    0.0)
+            # 角柱周りの流れ（簡易モデル）
+            for i in range(self.grid.nx):
+                for j in range(self.grid.ny):
+                    if outside[i, j]:
+                        x, y = self.X[i, j], self.Y[i, j]
+                        # 角の影響を考慮
+                        if np.abs(x - cx) < 2*R and np.abs(y - cy) < 2*R:
+                            # 流れの偏向
+                            deflection = np.exp(-((x-cx)**2 + (y-cy)**2) / (4*R**2))
+                            u[i, j] = U * (1 - 0.5*deflection)
+                            if y > cy:
+                                v[i, j] = U * 0.3 * deflection
+                            else:
+                                v[i, j] = -U * 0.3 * deflection
             
-            # 速度場の修正
-            u = u * deflection_x
-            v = v * deflection_y
-            
-            # エッジでの剥離点（角の位置で固定）
-            edge_mask = (corner_dist < 5.0) & ~inside
-            u[edge_mask] *= 0.5  # エッジでの速度低下
-            v[edge_mask] *= 0.5
-            
-            # 内部は速度ゼロ
-            u[inside] = 0
-            v[inside] = 0
-            
-        return u, v
+            # 流線関数の計算（速度場から逆算）
+            psi = self._velocity_to_stream_function(u, v)
+        
+        return psi, u, v
     
-    def calculate_pressure_field(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """圧力場の計算（ベルヌーイの定理）"""
-        # P + 0.5*ρ*V² = P∞ + 0.5*ρ*U∞²
+    def _velocity_to_stream_function(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """速度場から流線関数を計算（積分）"""
+        psi = np.zeros_like(u)
+        # 簡易的な積分（下端から）
+        for i in range(self.grid.nx):
+            for j in range(1, self.grid.ny):
+                psi[i, j] = psi[i, j-1] + u[i, j-1] * self.grid.dy
+        return psi
+    
+    def calculate_geometric_pressure(self, psi: np.ndarray, 
+                                   u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """幾何学的圧力場の計算"""
+        U_inf = self.flow.U_inf
+        params = self.physics_params
+        
+        # 1. 基本ベルヌーイ圧力
         V_squared = u**2 + v**2
-        U_inf_squared = self.flow.U_inf**2
+        Cp_bernoulli = 1.0 - V_squared / U_inf**2  # 圧力係数
         
-        # 無次元化
-        Cp = 1.0 - V_squared / U_inf_squared  # 圧力係数
+        # 2. 流線の曲率による補正
+        curvature = self._compute_streamline_curvature(psi)
+        Cp_curvature = -0.1 * curvature * np.sqrt(V_squared) / U_inf
         
-        # 圧力比 (P/P_inf)
+        # 3. 後流での圧力欠損（実験値ベース）
+        wake_pressure_deficit = self._compute_wake_pressure_deficit()
+        
+        # 4. 渦形成領域での圧力変動
+        vortex_pressure = self._compute_vortex_pressure_pattern()
+        
+        # 5. 合成
+        Cp = Cp_bernoulli + Cp_curvature + wake_pressure_deficit + vortex_pressure
+        
+        # 圧力比として返す（無次元）
         pressure_ratio = 1.0 + 0.5 * Cp
         
-        # 物理的な範囲に制限
-        pressure_ratio = np.clip(pressure_ratio, 0.5, 2.0)
-        
-        return pressure_ratio
+        return np.clip(pressure_ratio, 0.3, 2.0)
     
-    def calculate_density_field(self, pressure_ratio: np.ndarray) -> np.ndarray:
-        """密度場の計算（理想気体）"""
-        # P = ρRT より ρ/ρ_inf = P/P_inf （温度一定）
-        density_ratio = pressure_ratio
+    def _compute_streamline_curvature(self, psi: np.ndarray) -> np.ndarray:
+        """流線の曲率を計算"""
+        # 流線関数の勾配
+        dpsi_dx = np.gradient(psi, self.grid.dx, axis=0)
+        dpsi_dy = np.gradient(psi, self.grid.dy, axis=1)
         
-        # 後流での密度低下を追加（実験的補正）
-        if self.obstacle.shape_type != 'none':
-            wake_mask = self.calculate_wake_region()
-            # 後流では密度が10-30%低下
-            density_ratio = density_ratio * (1 - 0.2 * wake_mask)
+        # 二階微分
+        d2psi_dx2 = np.gradient(dpsi_dx, self.grid.dx, axis=0)
+        d2psi_dy2 = np.gradient(dpsi_dy, self.grid.dy, axis=1)
         
-        # 物理的な範囲に制限
-        density_ratio = np.clip(density_ratio, 0.5, 2.0)
+        # 曲率の近似
+        grad_norm = np.sqrt(dpsi_dx**2 + dpsi_dy**2) + 1e-8
+        curvature = np.abs(d2psi_dx2 + d2psi_dy2) / grad_norm
         
-        return density_ratio
+        # スムージング
+        curvature = gaussian_filter(curvature, sigma=2.0)
+        
+        return np.clip(curvature, 0, 10.0)
     
-    def calculate_separation_field(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """剥離傾向場の計算"""
-        separation = np.zeros_like(self.X)
+    def _compute_wake_pressure_deficit(self) -> np.ndarray:
+        """後流での圧力欠損"""
+        cx, cy = self.obstacle.center_x, self.obstacle.center_y
+        R = self.obstacle.size
+        params = self.physics_params
         
-        if self.obstacle.shape_type == 'none':
-            return separation
+        deficit = np.zeros_like(self.X)
         
-        # 速度勾配から剥離傾向を推定
-        du_dx = np.gradient(u, axis=0)
-        du_dy = np.gradient(u, axis=1)
-        dv_dx = np.gradient(v, axis=0)
-        dv_dy = np.gradient(v, axis=1)
+        # 後流領域
+        x_wake = self.X - cx - R
+        y_wake = self.Y - cy
         
-        # 逆圧力勾配の指標
-        adverse_pressure = du_dx < 0
+        # 基底圧力（実験値）
+        base_pressure = params['base_pressure']
+        
+        # 後流幅（下流に向かって広がる）
+        wake_width = R * params['wake_width_factor'] * (1 + x_wake / (10*R))
+        
+        # 圧力回復
+        recovery = 1 - np.exp(-x_wake / (params['recovery_length'] * R))
+        
+        # 後流内での圧力分布
+        in_wake = (x_wake > 0) & (np.abs(y_wake) < wake_width)
+        
+        # Y方向のガウス分布
+        y_distribution = np.exp(-(y_wake / wake_width)**2)
+        
+        deficit = np.where(in_wake,
+                          base_pressure * (1 - recovery) * y_distribution,
+                          0)
+        
+        return deficit
+    
+    def _compute_vortex_pressure_pattern(self) -> np.ndarray:
+        """渦形成パターンによる圧力変動"""
+        cx, cy = self.obstacle.center_x, self.obstacle.center_y
+        R = self.obstacle.size
+        params = self.physics_params
+        
+        pattern = np.zeros_like(self.X)
+        
+        # 渦形成領域
+        x_wake = self.X - cx - R * params['vortex_formation_length']
+        y_wake = self.Y - cy
         
         if self.obstacle.shape_type == 'cylinder':
-            # 円柱の場合
-            dx = self.X - self.obstacle.center_x
-            dy = self.Y - self.obstacle.center_y
+            # カルマン渦列の幾何学的パターン
+            St = params['strouhal_number']
+            wavelength = 1.0 / St * 2 * R  # 渦の間隔
+            
+            # 上下交互の渦列
+            phase = 2 * np.pi * x_wake / wavelength
+            amplitude = 0.5 * R * np.exp(-x_wake / (10*R))
+            
+            # 上側渦列
+            upper_vortex_y = amplitude * np.sin(phase)
+            upper_distance = np.abs(y_wake - upper_vortex_y)
+            upper_pressure = -0.3 * np.exp(-(upper_distance / R)**2)
+            
+            # 下側渦列（位相が逆）
+            lower_vortex_y = -amplitude * np.sin(phase)
+            lower_distance = np.abs(y_wake - lower_vortex_y)
+            lower_pressure = -0.3 * np.exp(-(lower_distance / R)**2)
+            
+            pattern = np.where(x_wake > 0, upper_pressure + lower_pressure, 0)
+            
+        elif self.obstacle.shape_type == 'square':
+            # より強い渦、より規則的
+            St = params['strouhal_number']
+            wavelength = 1.0 / St * 2 * R
+            
+            phase = 2 * np.pi * x_wake / wavelength
+            amplitude = 0.8 * R * np.exp(-x_wake / (15*R))
+            
+            # エッジから放出される強い渦
+            upper_vortex_y = R + amplitude * np.sin(phase)
+            lower_vortex_y = -R - amplitude * np.sin(phase)
+            
+            upper_distance = np.abs(y_wake - upper_vortex_y)
+            lower_distance = np.abs(y_wake - lower_vortex_y)
+            
+            # 角柱は渦が強い
+            upper_pressure = -0.5 * np.exp(-(upper_distance / (0.8*R))**2)
+            lower_pressure = -0.5 * np.exp(-(lower_distance / (0.8*R))**2)
+            
+            pattern = np.where(x_wake > 0, upper_pressure + lower_pressure, 0)
+        
+        return pattern
+    
+    def calculate_density_from_pressure(self, pressure: np.ndarray) -> np.ndarray:
+        """圧力から密度を計算（等温過程）"""
+        # ρ/ρ∞ = P/P∞（理想気体、等温）
+        density_ratio = pressure
+        
+        # 渦コアでの密度低下を強調
+        vortex_regions = pressure < 0.8
+        density_ratio = np.where(vortex_regions,
+                                 density_ratio * 0.9,
+                                 density_ratio)
+        
+        return np.clip(density_ratio, 0.5, 1.5)
+    
+    def calculate_separation_zones(self) -> np.ndarray:
+        """剥離領域の計算"""
+        cx, cy = self.obstacle.center_x, self.obstacle.center_y
+        R = self.obstacle.size
+        params = self.physics_params
+        
+        separation = np.zeros_like(self.X)
+        
+        if self.obstacle.shape_type == 'cylinder':
+            # 剥離点から下流
+            dx = self.X - cx
+            dy = self.Y - cy
             r = np.sqrt(dx**2 + dy**2)
             theta = np.arctan2(dy, dx)
             
-            # 境界層内
-            in_boundary = (r > self.obstacle.size) & (r < self.obstacle.size + 10)
+            # 剥離角度以降
+            sep_angle = params['separation_angle']
+            is_separated = ((np.abs(theta) > sep_angle) & (np.abs(theta) < np.pi) &
+                          (r > R) & (r < R + 10))
             
-            # 60度以降で剥離しやすい
-            separation_angle = np.abs(theta) > np.pi/3
-            
-            separation[in_boundary & separation_angle & adverse_pressure] = 0.8
-            
-            # 90度以降はほぼ確実に剥離
-            strong_separation = np.abs(theta) > np.pi/2
-            separation[in_boundary & strong_separation] = 1.0
+            separation = np.where(is_separated, 1.0, 0.0)
             
         elif self.obstacle.shape_type == 'square':
-            dx = self.X - self.obstacle.center_x
-            dy = self.Y - self.obstacle.center_y
+            # エッジから即座に剥離
+            dx = self.X - cx
+            dy = self.Y - cy
             
-            # 前縁エッジ（左側！）← ここが重要！
-            front_edge = (np.abs(dx + self.obstacle.size) < 5) & \
-                         (np.abs(dy) <= self.obstacle.size)
-            separation[front_edge] = 1.0
+            # 前縁エッジ
+            at_edges = ((np.abs(dx - R) < 5) & (np.abs(dy) <= R))
+            # コーナー
+            at_corners = ((np.abs(np.abs(dx) - R) < 5) & 
+                         (np.abs(np.abs(dy) - R) < 5))
             
-            # 4つの角での剥離も追加
-            corners = ((np.abs(np.abs(dx) - self.obstacle.size) < 3) & \
-                       (np.abs(np.abs(dy) - self.obstacle.size) < 3))
-            separation[corners] = 1.0
-            
-        return separation
-    
-    def calculate_vorticity_potential(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        """渦度生成ポテンシャル場"""
-        # 渦度 ω = ∂v/∂x - ∂u/∂y
-        dv_dx = np.gradient(v, axis=0)
-        du_dy = np.gradient(u, axis=1)
-        vorticity = dv_dx - du_dy
-        
-        # 渦度の絶対値（渦の強さ）
-        vorticity_potential = np.abs(vorticity)
+            separation = np.where(at_edges | at_corners, 1.0, 0.0)
         
         # スムージング
-        vorticity_potential = gaussian_filter(vorticity_potential, sigma=1.0)
+        separation = gaussian_filter(separation, sigma=1.0)
         
-        return vorticity_potential
+        return separation
     
-    def calculate_wake_region(self) -> np.ndarray:
-        """後流領域のマスク（0-1）"""
+    def calculate_vortex_formation_zones(self) -> np.ndarray:
+        """渦形成領域"""
+        cx, cy = self.obstacle.center_x, self.obstacle.center_y
+        R = self.obstacle.size
+        params = self.physics_params
+        
+        formation = np.zeros_like(self.X)
+        
+        # 渦形成長さの位置から開始
+        x_formation = self.X - cx - R * params['vortex_formation_length']
+        y_wake = self.Y - cy
+        
+        # 渦形成領域（後流の初期部分）
+        in_formation = ((x_formation > 0) & 
+                       (x_formation < 5*R) &
+                       (np.abs(y_wake) < 2*R))
+        
+        # 上下で交互に強くなる
+        upper_strength = np.where(y_wake > 0, 1.0, 0.3)
+        lower_strength = np.where(y_wake <= 0, 1.0, 0.3)
+        
+        alternating = np.sin(2*np.pi * x_formation / (5*R))
+        
+        formation = np.where(in_formation,
+                           np.where(alternating > 0,
+                                   upper_strength,
+                                   lower_strength),
+                           0)
+        
+        return gaussian_filter(formation, sigma=2.0)
+    
+    def calculate_wake_structure(self) -> np.ndarray:
+        """後流構造"""
+        cx, cy = self.obstacle.center_x, self.obstacle.center_y
+        R = self.obstacle.size
+        params = self.physics_params
+        
         wake = np.zeros_like(self.X)
         
-        if self.obstacle.shape_type == 'none':
-            return wake
+        x_wake = self.X - cx
+        y_wake = self.Y - cy
         
-        # 障害物の後方
-        behind = self.X > self.obstacle.center_x
+        # 後流幅
+        wake_width = R * params['wake_width_factor'] * np.sqrt(1 + x_wake / (10*R))
         
-        # Y方向の広がり（距離とともに拡大）
-        distance_from_obstacle = self.X - self.obstacle.center_x
-        wake_width = self.obstacle.size + 0.3 * np.maximum(distance_from_obstacle, 0)
+        in_wake = (x_wake > R) & (np.abs(y_wake) < wake_width)
         
-        within_wake_width = np.abs(self.Y - self.obstacle.center_y) < wake_width
+        # 中心ほど強い
+        intensity = np.exp(-(y_wake / wake_width)**2)
         
-        # 後流の強度（距離とともに減衰）
-        wake_strength = np.exp(-distance_from_obstacle / (5 * self.obstacle.size))
-        wake_strength = np.clip(wake_strength, 0, 1)
+        # 下流に向かって減衰
+        decay = np.exp(-x_wake / (20*R))
         
-        wake[behind & within_wake_width] = wake_strength[behind & within_wake_width]
+        wake = np.where(in_wake, intensity * decay, 0)
         
         return wake
     
-    def calculate_boundary_layer(self) -> np.ndarray:
-        """境界層厚さ分布"""
-        boundary = np.zeros_like(self.X)
+    def calculate_shear_layers(self) -> np.ndarray:
+        """せん断層（剥離せん断層）"""
+        cx, cy = self.obstacle.center_x, self.obstacle.center_y
+        R = self.obstacle.size
         
-        if self.obstacle.shape_type == 'none':
-            return boundary
+        shear = np.zeros_like(self.X)
         
-        # Blasius境界層の理論
-        # δ ≈ 5.0 * x / sqrt(Re_x)
-        
-        if self.obstacle.shape_type in ['cylinder', 'square']:
-            dx = self.X - self.obstacle.center_x
-            dy = self.Y - self.obstacle.center_y
+        if self.obstacle.shape_type == 'cylinder':
+            # 剥離点から放出されるせん断層
+            dx = self.X - cx
+            dy = self.Y - cy
             r = np.sqrt(dx**2 + dy**2)
+            theta = np.arctan2(dy, dx)
             
-            # 表面からの距離
-            if self.obstacle.shape_type == 'cylinder':
-                dist_from_surface = r - self.obstacle.size
-            else:  # square
-                dist_from_surface = np.minimum(
-                    np.abs(dx) - self.obstacle.size,
-                    np.abs(dy) - self.obstacle.size
-                )
+            # 上下の剥離せん断層
+            upper_shear_angle = self.physics_params['separation_angle']
+            lower_shear_angle = -upper_shear_angle
             
-            # 境界層内（表面から10単位以内）
-            in_boundary = (dist_from_surface > 0) & (dist_from_surface < 10)
+            # せん断層の厚さ
+            shear_thickness = 0.1 * R * np.sqrt(1 + (r - R) / R)
             
-            # 境界層厚さ（簡易モデル）
-            Re_local = self.flow.U_inf * dist_from_surface / self.flow.nu
-            delta = 5.0 * dist_from_surface / np.sqrt(np.maximum(Re_local, 1))
+            upper_shear = np.abs(theta - upper_shear_angle) < shear_thickness / r
+            lower_shear = np.abs(theta - lower_shear_angle) < shear_thickness / r
             
-            boundary[in_boundary] = np.clip(delta[in_boundary], 0, 10)
+            shear = np.where((r > R) & (upper_shear | lower_shear), 1.0, 0.0)
+            
+        elif self.obstacle.shape_type == 'square':
+            # エッジから放出される強いせん断層
+            dx = self.X - cx
+            dy = self.Y - cy
+            
+            # 上下エッジから
+            from_upper_edge = ((dx > R) & (np.abs(dy - R) < 5))
+            from_lower_edge = ((dx > R) & (np.abs(dy + R) < 5))
+            
+            shear = np.where(from_upper_edge | from_lower_edge, 1.0, 0.0)
         
-        return boundary
-
-# ==============================
-# Data Export/Import
-# ==============================
-
-class FieldData:
-    """計算済み場のデータ管理"""
+        return gaussian_filter(shear, sigma=1.0)
     
-    def __init__(self, fields: dict, obstacle: ObstacleConfig, 
-                 flow: FlowConfig, grid: GridConfig):
-        self.fields = fields
-        self.obstacle = obstacle
-        self.flow = flow
-        self.grid = grid
+    def visualize_fields(self, fields: Dict[str, np.ndarray]) -> None:
+        """場の可視化"""
+        fig, axes = plt.subplots(3, 3, figsize=(15, 15))
         
-    def save(self, filename: str):
-        """NPZファイルとして保存"""
-        # メタデータをJSON文字列に
-        metadata = {
-            'obstacle': self.obstacle.__dict__,
-            'flow': self.flow.__dict__,
-            'grid': self.grid.__dict__
-        }
+        extent = [self.grid.x_min, self.grid.x_max, 
+                 self.grid.y_min, self.grid.y_max]
         
-        # 全データを保存
-        save_dict = {**self.fields}
-        save_dict['metadata'] = json.dumps(metadata)
+        # 各場をプロット
+        field_names = ['stream_function', 'pressure', 'density',
+                      'separation', 'vortex_formation', 'wake_structure',
+                      'shear_layer', 'velocity_u', 'velocity_v']
         
-        np.savez_compressed(filename, **save_dict)
-        print(f"Saved to {filename}")
-    
-    @classmethod
-    def load(cls, filename: str):
-        """NPZファイルから読み込み"""
-        data = np.load(filename, allow_pickle=True)
-        
-        # メタデータ復元
-        metadata = json.loads(str(data['metadata']))
-        obstacle = ObstacleConfig(**metadata['obstacle'])
-        flow = FlowConfig(**metadata['flow'])
-        grid = GridConfig(**metadata['grid'])
-        
-        # フィールドデータ復元
-        fields = {key: data[key] for key in data.files if key != 'metadata'}
-        
-        return cls(fields, obstacle, flow, grid)
-    
-    def visualize(self, figsize=(15, 10)):
-        """全フィールドの可視化"""
-        fig, axes = plt.subplots(2, 4, figsize=figsize)
-        axes = axes.flatten()
-        
-        # カラーマップの設定
-        field_configs = [
-            ('density', 'RdBu_r', 0.5, 1.5, 'Density Ratio'),
-            ('pressure', 'RdBu_r', 0.5, 1.5, 'Pressure Ratio'),
-            ('separation', 'hot', 0, 1, 'Separation Tendency'),
-            ('vorticity_potential', 'RdBu_r', None, None, 'Vorticity Potential'),
-            ('wake_region', 'Blues', 0, 1, 'Wake Region'),
-            ('boundary_layer', 'viridis', 0, 10, 'Boundary Layer'),
-        ]
-        
-        # 速度場はベクトル表示
-        ax = axes[0]
-        skip = 5  # ベクトルの間引き
-        u = self.fields['velocity_u'][::skip, ::skip]
-        v = self.fields['velocity_v'][::skip, ::skip]
-        x = np.linspace(self.grid.x_min, self.grid.x_max, self.grid.nx)[::skip]
-        y = np.linspace(self.grid.y_min, self.grid.y_max, self.grid.ny)[::skip]
-        X, Y = np.meshgrid(x, y, indexing='ij')
-        
-        speed = np.sqrt(u**2 + v**2)
-        ax.quiver(X, Y, u, v, speed, cmap='viridis', scale=50)
-        ax.set_title('Velocity Field')
-        ax.set_aspect('equal')
-        self.add_obstacle_outline(ax)
-        
-        # その他のフィールド
-        for i, (field_name, cmap, vmin, vmax, title) in enumerate(field_configs, 1):
-            if i >= len(axes):
-                break
+        for ax, name in zip(axes.flat, field_names):
+            if name in fields:
+                im = ax.imshow(fields[name].T, origin='lower',
+                             extent=extent, aspect='equal',
+                             cmap='RdBu_r' if 'pressure' in name or 'density' in name else 'viridis')
+                ax.set_title(name.replace('_', ' ').title())
+                plt.colorbar(im, ax=ax, fraction=0.046)
                 
-            ax = axes[i]
-            field = self.fields[field_name]
-            
-            im = ax.imshow(field.T, origin='lower', cmap=cmap,
-                          vmin=vmin, vmax=vmax,
-                          extent=[self.grid.x_min, self.grid.x_max,
-                                 self.grid.y_min, self.grid.y_max],
-                          aspect='equal')
-            ax.set_title(title)
-            plt.colorbar(im, ax=ax, fraction=0.046)
-            self.add_obstacle_outline(ax)
-        
-        # 最後の軸は流線
-        ax = axes[-1]
-        x = np.linspace(self.grid.x_min, self.grid.x_max, self.grid.nx)
-        y = np.linspace(self.grid.y_min, self.grid.y_max, self.grid.ny)
-        X, Y = np.meshgrid(x, y, indexing='ij')
-        
-        ax.streamplot(X.T, Y.T, 
-                     self.fields['velocity_u'].T,
-                     self.fields['velocity_v'].T,
-                     density=1.5, color='k', linewidth=0.5)
-        ax.set_title('Streamlines')
-        ax.set_aspect('equal')
-        self.add_obstacle_outline(ax)
+                # 障害物を描画
+                if self.obstacle.shape_type == 'cylinder':
+                    circle = plt.Circle((self.obstacle.center_x, self.obstacle.center_y),
+                                       self.obstacle.size, fill=False, color='red', linewidth=2)
+                    ax.add_patch(circle)
+                elif self.obstacle.shape_type == 'square':
+                    rect = plt.Rectangle(
+                        (self.obstacle.center_x - self.obstacle.size,
+                         self.obstacle.center_y - self.obstacle.size),
+                        2 * self.obstacle.size, 2 * self.obstacle.size,
+                        fill=False, color='red', linewidth=2
+                    )
+                    ax.add_patch(rect)
         
         plt.tight_layout()
-        return fig
-    
-    def add_obstacle_outline(self, ax):
-        """障害物の輪郭を追加"""
-        if self.obstacle.shape_type == 'cylinder':
-            circle = plt.Circle((self.obstacle.center_x, self.obstacle.center_y),
-                               self.obstacle.size, fill=False, color='red', linewidth=2)
-            ax.add_patch(circle)
-        elif self.obstacle.shape_type == 'square':
-            rect = plt.Rectangle(
-                (self.obstacle.center_x - self.obstacle.size,
-                 self.obstacle.center_y - self.obstacle.size),
-                2 * self.obstacle.size, 2 * self.obstacle.size,
-                fill=False, color='red', linewidth=2
-            )
-            ax.add_patch(rect)
+        plt.show()
 
 # ==============================
 # Main Function
 # ==============================
 
-def main():
-    """使用例"""
+def generate_geometric_map(shape='cylinder', Re=200, save=True):
+    """幾何学的ベルヌーイマップを生成"""
+    
+    print(f"\n{'='*60}")
+    print(f"Generating Geometric Bernoulli Map")
+    print(f"Shape: {shape}, Re: {Re}")
+    print(f"{'='*60}")
     
     # 設定
-    obstacle = ObstacleConfig(
-        shape_type='cylinder',  # 'cylinder', 'square', 'airfoil', 'none'
-        center_x=100,
-        center_y=75,
-        size=20
-    )
-    
-    flow = FlowConfig(
-        U_inf=10.0,  # 風速 10 m/s
-        rho_inf=1.225,
-        P_inf=101325.0,
-        T_inf=293.0,
-        nu=2.0  # Re=200になるように調整
-    )
-    
-    grid = GridConfig(
-        nx=300,
-        ny=150,
-        x_max=300,
-        y_max=150
-    )
+    obstacle = ObstacleConfig(shape_type=shape)
+    flow = FlowConfig(Re=Re)
+    grid = GridConfig()
     
     # 計算
-    print(f"Calculating fields for {obstacle.shape_type}...")
-    Re = flow.U_inf * obstacle.size * 2 / flow.nu
-    print(f"Reynolds number: Re = {Re:.1f}")
-    
-    calculator = DensityFieldCalculator(obstacle, flow, grid)
+    calculator = GeometricBernoulliCalculator(obstacle, flow, grid)
     fields = calculator.calculate_all_fields()
     
-    # データ管理
-    field_data = FieldData(fields, obstacle, flow, grid)
-    
     # 保存
-    filename = f"{obstacle.shape_type}_Re{int(Re)}_fields.npz"
-    field_data.save(filename)
+    if save:
+        filename = f"{shape}_Re{int(Re)}_geometric.npz"
+        
+        # メタデータ
+        metadata = {
+            'obstacle': obstacle.__dict__,
+            'flow': flow.__dict__,
+            'grid': grid.__dict__,
+            'physics_params': calculator.physics_params
+        }
+        
+        # 保存
+        save_dict = {**fields, 'metadata': json.dumps(metadata)}
+        np.savez_compressed(filename, **save_dict)
+        print(f"\nSaved to {filename}")
+        
+        # 統計表示
+        print("\nField statistics:")
+        for name, field in fields.items():
+            print(f"  {name:20s}: min={field.min():.3f}, "
+                  f"max={field.max():.3f}, mean={field.mean():.3f}")
     
     # 可視化
-    fig = field_data.visualize()
-    plt.savefig(f"{obstacle.shape_type}_fields.png", dpi=150, bbox_inches='tight')
-    plt.show()
+    calculator.visualize_fields(fields)
     
-    print("\nField statistics:")
-    for name, field in fields.items():
-        if field.ndim == 2:  # スカラー場のみ
-            print(f"  {name:20s}: min={field.min():.3f}, max={field.max():.3f}, mean={field.mean():.3f}")
-    
-    return field_data
+    return fields
+
+# ==============================
+# 使用例
+# ==============================
 
 if __name__ == "__main__":
-    field_data = main()
-    print("\n✨ Density map generation complete! Ready for GET Wind™!")
+    # 円柱のマップ生成
+    cylinder_fields = generate_geometric_map('cylinder', Re=200)
+    
+    # 角柱のマップ生成
+    square_fields = generate_geometric_map('square', Re=200)
+    
+    print("\n✨ Geometric Bernoulli Maps generated!")
+    print("Ready for GET Wind™ particle simulation!")
