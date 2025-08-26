@@ -1029,8 +1029,8 @@ def physics_step_v62(state: ParticleState,
         
         # === 剥離領域での処理：MAP活用版 ===
         # 渦度ポテンシャルと後流も読み込む
-        local_vorticity_pot = bilinear_interpolate(vorticity_map, grid_x, grid_y, map_nx, map_ny)
-        local_wake = bilinear_interpolate(wake_map, grid_x, grid_y, map_nx, map_ny)
+        local_vorticity_pot = bilinear_interpolate(vorticity_potential_map, grid_x, grid_y, map_nx, map_ny)
+        local_wake = bilinear_interpolate(wake_region_map, grid_x, grid_y, map_nx, map_ny)
         
         # MAPベースの剥離強度（形状別処理不要）
         separation_strength = jnp.maximum(
