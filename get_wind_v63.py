@@ -34,8 +34,10 @@ SHAPE_SQUARE = 1
 # Configuration
 # ==============================
 
+from typing import NamedTuple
+
 class GETWindConfig(NamedTuple):
-    """GET Wind™ v6.3 設定（幾何MAP対応）"""
+    """GET Wind™ v6.3 設定（幾何MAP対応・物理単位版）"""
     # 障害物形状
     obstacle_shape: int = 0  # 0=cylinder, 1=square
     
@@ -47,10 +49,14 @@ class GETWindConfig(NamedTuple):
     map_nx: int = 300
     map_ny: int = 150
     
+    # ✨ 物理スケーリング（NEW!）
+    scale_m_per_unit: float = 0.001    # 1 grid unit = 1mm = 0.001m
+    scale_s_per_step: float = 0.01     # 1 time step = 0.01s = 10ms
+    
     # Λ³パラメータ（コアは維持！）
-    Lambda_F_inlet: float = 10.0
-    thermal_alpha: float = 0.008      # 温度勾配の重み
-    density_beta: float = 0.015       # 密度勾配の重み
+    Lambda_F_inlet: float = 10.0       # [unit/step] → 1.0 m/s with default scaling
+    thermal_alpha: float = 0.008       # 温度勾配の重み
+    density_beta: float = 0.015        # 密度勾配の重み
     structure_coupling: float = 0.025  # 構造結合強度
     viscosity_factor: float = 40.0     # 粘性係数
     interaction_strength: float = 0.1  # 粒子間相互作用強度
@@ -69,7 +75,7 @@ class GETWindConfig(NamedTuple):
     min_particles_per_region: int = 20
     vortex_grid_size: float = 10.0
     
-    # 幾何MAP用パラメータ（新規）
+    # 幾何MAP用パラメータ
     shear_instability_strength: float = 0.5   # せん断層不安定性
     vortex_formation_noise: float = 1.0       # 渦形成領域の乱流強度
     wake_turbulence_factor: float = 0.8       # 後流乱流係数
@@ -77,13 +83,131 @@ class GETWindConfig(NamedTuple):
     # 粒子パラメータ
     particles_per_step: float = 5.0
     max_particles: int = 1500
-    dt: float = 0.05
+    dt: float = 0.05                   # [step] → 0.5ms with default scaling
     n_steps: int = 3000
     
     # 物理定数
-    obstacle_center_x: float = 100.0
-    obstacle_center_y: float = 75.0
-    obstacle_size: float = 20.0
+    obstacle_center_x: float = 100.0   # [unit] → 100mm with default scaling
+    obstacle_center_y: float = 75.0    # [unit] → 75mm with default scaling
+    obstacle_size: float = 20.0        # [unit] radius → 20mm with default scaling
+    
+    # === 物理量計算用プロパティ ===
+    
+    @property
+    def domain_width_m(self) -> float:
+        """領域幅 [m]"""
+        return self.domain_width * self.scale_m_per_unit
+    
+    @property
+    def domain_height_m(self) -> float:
+        """領域高さ [m]"""
+        return self.domain_height * self.scale_m_per_unit
+    
+    @property
+    def obstacle_diameter_m(self) -> float:
+        """障害物直径 [m]"""
+        return 2 * self.obstacle_size * self.scale_m_per_unit
+    
+    @property
+    def obstacle_radius_m(self) -> float:
+        """障害物半径 [m]"""
+        return self.obstacle_size * self.scale_m_per_unit
+    
+    @property
+    def dt_s(self) -> float:
+        """時間ステップ [s]"""
+        return self.dt * self.scale_s_per_step
+    
+    @property
+    def inlet_velocity_ms(self) -> float:
+        """入口流速 [m/s]"""
+        return self.Lambda_F_inlet * self.scale_m_per_unit / self.scale_s_per_step
+    
+    @property
+    def Reynolds_number(self) -> float:
+        """物理的Reynolds数 (空気 @ 20°C)"""
+        D = self.obstacle_diameter_m
+        U = self.inlet_velocity_ms
+        nu = 1.5e-5  # 空気の動粘性係数 [m²/s] @ 20°C
+        return U * D / nu
+    
+    @property
+    def blockage_ratio(self) -> float:
+        """ブロッケージ比（障害物直径/領域高さ）"""
+        return self.obstacle_diameter_m / self.domain_height_m
+    
+    @property
+    def expected_Strouhal(self) -> float:
+        """期待されるStrouhal数（Re依存）"""
+        Re = self.Reynolds_number
+        if Re < 100:
+            return 0.16
+        elif Re < 250:
+            return 0.195  # カルマン渦の典型値
+        elif Re < 1000:
+            return 0.20
+        else:
+            return 0.21
+    
+    @property
+    def expected_shedding_frequency(self) -> float:
+        """期待される渦放出周波数 [Hz]"""
+        St = self.expected_Strouhal
+        U = self.inlet_velocity_ms
+        D = self.obstacle_diameter_m
+        return St * U / D
+    
+    @property
+    def simulation_time_s(self) -> float:
+        """総シミュレーション時間 [s]"""
+        return self.n_steps * self.dt_s
+    
+    @property
+    def vortex_shedding_periods(self) -> float:
+        """シミュレーション中の渦放出周期数"""
+        f = self.expected_shedding_frequency
+        if f > 0:
+            return self.simulation_time_s * f
+        return 0.0
+    
+    def print_physical_summary(self):
+        """物理パラメータのサマリーを表示"""
+        print("=" * 70)
+        print("GET Wind™ v6.3 - Physical Parameters Summary")
+        print("=" * 70)
+        
+        print("\n📏 SCALES:")
+        print(f"  Length scale: {self.scale_m_per_unit*1000:.3f} mm/unit")
+        print(f"  Time scale: {self.scale_s_per_step*1000:.1f} ms/step")
+        
+        print("\n🏛️ GEOMETRY:")
+        print(f"  Domain: {self.domain_width_m*1000:.0f} × {self.domain_height_m*1000:.0f} mm")
+        print(f"  Obstacle: {self.obstacle_diameter_m*1000:.1f} mm diameter")
+        print(f"  Center: ({self.obstacle_center_x*self.scale_m_per_unit*1000:.0f}, "
+              f"{self.obstacle_center_y*self.scale_m_per_unit*1000:.0f}) mm")
+        print(f"  Blockage: {self.blockage_ratio:.1%}")
+        
+        print("\n💨 FLOW:")
+        print(f"  Inlet velocity: {self.inlet_velocity_ms:.3f} m/s")
+        print(f"  Reynolds number: {self.Reynolds_number:.0f}")
+        print(f"  Expected Strouhal: {self.expected_Strouhal:.3f}")
+        print(f"  Expected shedding freq: {self.expected_shedding_frequency:.3f} Hz")
+        
+        print("\n⏱️ TIME:")
+        print(f"  Time step: {self.dt_s*1000:.1f} ms")
+        print(f"  Total steps: {self.n_steps}")
+        print(f"  Simulation time: {self.simulation_time_s:.2f} s")
+        print(f"  Vortex periods: ~{self.vortex_shedding_periods:.0f}")
+        
+        print("\n🎯 VALIDATION:")
+        if self.blockage_ratio > 0.2:
+            print(f"  ⚠ High blockage ({self.blockage_ratio:.1%}) may affect results")
+        if self.vortex_shedding_periods < 10:
+            print(f"  ⚠ Short simulation ({self.vortex_shedding_periods:.1f} periods)")
+        if 150 < self.Reynolds_number < 250:
+            print(f"  ✅ Reynolds in optimal range for vortex shedding")
+        
+        print("=" * 70)
 
 # ==============================
 # Map Manager (v6.3: 幾何MAP対応)
