@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GET Wind™ v6.3 JAX Edition - Geometric Bernoulli Map Integration
+GET Wind™ v6.3 JAX Edition - Geometric Bernoulli Map Integration [FIXED]
 環ちゃん & ご主人さま Ultimate Geometry Edition! 💕
 
-v6.3の改良点：
-  - 幾何学的ベルヌーイMAPとの完全統合
-  - 理想流体速度場の削除（物理的整合性向上）
-  - せん断層での不安定性導入
-  - 渦形成領域での自然な乱流生成
+v6.3 Fixed Edition:
+  - 座標変換とグリッド補間の修正
+  - 物理勾配計算の正確化
+  - compute_efficiencyの行列射影修正
+  - ΛF更新の一本化
+  - lax.condによる分岐最適化
 """
 
 import jax
@@ -105,10 +106,10 @@ class GeometricMapData:
         self.wake_structure = jnp.array(data['wake_structure'])
         self.shear_layer = jnp.array(data['shear_layer'])
         
-        # グリッド情報
-        self.nx, self.ny = self.pressure.shape
+        # グリッド情報（環の修正：shape順序を明確化）
+        self.nx, self.ny = self.pressure.shape  # (cols, rows)
         
-        print(f"Geometric map loaded: {self.nx}x{self.ny} grid")
+        print(f"Geometric map loaded: {self.nx}x{self.ny} (cols x rows)")
         print(f"  Available fields: stream_function, pressure, density,")
         print(f"                   separation, vortex_formation,")
         print(f"                   wake_structure, shear_layer")
@@ -154,44 +155,72 @@ class ParticleState(NamedTuple):
     near_wall: jnp.ndarray      # (N,) 壁近傍フラグ
 
 # ==============================
-# 補間処理（変更なし）
+# 補間処理（環の修正版：座標変換と行列順序対応）
 # ==============================
 
 @jit
-def bilinear_interpolate(field: jnp.ndarray, x: float, y: float, 
-                         nx: int, ny: int) -> float:
-    """バイリニア補間"""
-    i = jnp.clip(jnp.floor(x).astype(int), 0, nx-2)
-    j = jnp.clip(jnp.floor(y).astype(int), 0, ny-2)
+def world_to_grid(x: float, y: float, 
+                  domain_w: float, domain_h: float, 
+                  nx: int, ny: int) -> Tuple[float, float]:
+    """物理座標→グリッド座標変換"""
+    gx = (x / (domain_w + 1e-8)) * (nx - 1)
+    gy = (y / (domain_h + 1e-8)) * (ny - 1)
+    gx = jnp.clip(gx, 0.0, nx - 1.0)
+    gy = jnp.clip(gy, 0.0, ny - 1.0)
+    return gx, gy
+
+@jit
+def bilinear_interpolate_rc(field: jnp.ndarray, 
+                            gx: float, gy: float, 
+                            nx: int, ny: int) -> float:
+    """バイリニア補間（row-column順序対応）"""
+    # gx, gy は [0, nx-1], [0, ny-1] のグリッド座標
+    j = jnp.clip(jnp.floor(gx).astype(int), 0, nx - 2)  # col (=x)
+    i = jnp.clip(jnp.floor(gy).astype(int), 0, ny - 2)  # row (=y)
     
-    fx = x - i
-    fy = y - j
+    fx = gx - j
+    fy = gy - i
     
-    v00 = field[i, j]
-    v10 = field[jnp.minimum(i+1, nx-1), j]
-    v01 = field[i, jnp.minimum(j+1, ny-1)]
-    v11 = field[jnp.minimum(i+1, nx-1), jnp.minimum(j+1, ny-1)]
+    # field[row, col] = field[y, x] の順序に注意
+    v00 = field[j, i]      # field[x, y]
+    v10 = field[j + 1, i]
+    v01 = field[j, i + 1]
+    v11 = field[j + 1, i + 1]
     
     return (1-fx)*(1-fy)*v00 + fx*(1-fy)*v10 + (1-fx)*fy*v01 + fx*fy*v11
 
 @jit
-def compute_gradient_from_map(field: jnp.ndarray, x: float, y: float,
-                              nx: int, ny: int) -> jnp.ndarray:
-    """マップから勾配を計算"""
-    h = 1.0
+def gradient_from_map_rc(field: jnp.ndarray, 
+                        x: float, y: float,
+                        domain_w: float, domain_h: float, 
+                        nx: int, ny: int) -> jnp.ndarray:
+    """物理勾配計算（正確なスケーリング付き）"""
+    dx = domain_w / (nx - 1)
+    dy = domain_h / (ny - 1)
     
-    fx_plus = bilinear_interpolate(field, jnp.minimum(x+h, nx-1), y, nx, ny)
-    fx_minus = bilinear_interpolate(field, jnp.maximum(x-h, 0), y, nx, ny)
-    grad_x = (fx_plus - fx_minus) / (2*h)
+    gx, gy = world_to_grid(x, y, domain_w, domain_h, nx, ny)
     
-    fy_plus = bilinear_interpolate(field, x, jnp.minimum(y+h, ny-1), nx, ny)
-    fy_minus = bilinear_interpolate(field, x, jnp.maximum(y-h, 0), nx, ny)
-    grad_y = (fy_plus - fy_minus) / (2*h)
+    # 中心差分を格子空間で
+    val_xp = bilinear_interpolate_rc(field, 
+                                     jnp.minimum(gx + 1.0, nx - 1.0), gy, 
+                                     nx, ny)
+    val_xm = bilinear_interpolate_rc(field, 
+                                     jnp.maximum(gx - 1.0, 0.0), gy, 
+                                     nx, ny)
+    val_yp = bilinear_interpolate_rc(field, 
+                                     gx, jnp.minimum(gy + 1.0, ny - 1.0), 
+                                     nx, ny)
+    val_ym = bilinear_interpolate_rc(field, 
+                                     gx, jnp.maximum(gy - 1.0, 0.0), 
+                                     nx, ny)
     
-    return jnp.array([grad_x, grad_y])
+    dfdx = (val_xp - val_xm) / (2.0 * dx)
+    dfdy = (val_yp - val_ym) / (2.0 * dy)
+    
+    return jnp.array([dfdx, dfdy])
 
 # ==============================
-# Λ³構造テンソル計算（変更なし！重要！）
+# Λ³構造テンソル計算（環の修正版：効率計算改良）
 # ==============================
 
 @jit
@@ -236,17 +265,20 @@ def compute_vortex_quantities(grad_Lambda: jnp.ndarray) -> Tuple[float, float, f
     return Q, lambda2, vorticity
 
 @jit
-def compute_efficiency(Lambda_core: jnp.ndarray, Lambda_F: jnp.ndarray) -> float:
-    """構造の効率計算"""
-    norm_LF = jnp.linalg.norm(Lambda_F) + 1e-8
+def compute_efficiency(Lambda_core_flat: jnp.ndarray, Lambda_F: jnp.ndarray) -> float:
+    """構造の効率計算（環の修正版：行列-ベクトル射影）"""
+    G = Lambda_core_flat.reshape(2, 2)
+    v = Lambda_F
+    vn = jnp.linalg.norm(v) + 1e-8
     
-    # Lambda_coreの最初の2成分をΛFに射影
-    proj = jnp.dot(Lambda_core[:2], Lambda_F) / norm_LF
+    # Gがvをどれだけ伸縮/回転させるかのv方向成分
+    Gv = G @ v
+    proj_mag = jnp.dot(Gv, v) / vn
     
     # 構造の一貫性
-    coherence = jnp.exp(-jnp.var(Lambda_core))
+    coherence = jnp.exp(-jnp.var(G))
     
-    return jnp.abs(proj) * coherence
+    return jnp.abs(proj_mag) * coherence
 
 @jit
 def compute_sigma_s(rho_T_i: float, Lambda_F_i: jnp.ndarray,
@@ -595,10 +627,10 @@ def find_neighbors(positions: jnp.ndarray, active_mask: jnp.ndarray,
     return neighbor_indices, neighbor_mask
 
 # ==============================
-# メイン物理ステップ（v6.3: 幾何MAP対応）
+# メイン物理ステップ（v6.3 Fixed: 環の修正適用）
 # ==============================
 
-@partial(jit, static_argnums=(7,))
+@partial(jit, static_argnums=(7, 8))
 def physics_step_v63(state: ParticleState,
                     pressure_map: jnp.ndarray,
                     density_map: jnp.ndarray,
@@ -609,7 +641,7 @@ def physics_step_v63(state: ParticleState,
                     map_nx: int, map_ny: int,
                     config: GETWindConfig,
                     key: random.PRNGKey) -> ParticleState:
-    """v6.3の物理ステップ（幾何MAP駆動）"""
+    """v6.3の物理ステップ（幾何MAP駆動・修正版）"""
     
     active_mask = state.is_active
     N = state.position.shape[0]
@@ -635,24 +667,29 @@ def physics_step_v63(state: ParticleState,
     def update_particle(i):
         """各粒子の更新"""
         is_active = active_mask[i]
-        
         pos = state.position[i]
-        grid_x = pos[0]
-        grid_y = pos[1]
         
-        # === 1. 幾何MAPから場を取得 ===
-        local_pressure = bilinear_interpolate(pressure_map, grid_x, grid_y, map_nx, map_ny)
-        local_density = bilinear_interpolate(density_map, grid_x, grid_y, map_nx, map_ny)
-        local_separation = bilinear_interpolate(separation_map, grid_x, grid_y, map_nx, map_ny)
-        local_vortex_formation = bilinear_interpolate(vortex_formation_map, grid_x, grid_y, map_nx, map_ny)
-        local_wake = bilinear_interpolate(wake_structure_map, grid_x, grid_y, map_nx, map_ny)
-        local_shear = bilinear_interpolate(shear_layer_map, grid_x, grid_y, map_nx, map_ny)
+        # === 1. 座標変換と幾何MAPから場を取得（環の修正） ===
+        gx, gy = world_to_grid(pos[0], pos[1], 
+                               config.domain_width, config.domain_height, 
+                               map_nx, map_ny)
         
-        # 勾配（物理的な力の源）
-        grad_pressure = compute_gradient_from_map(pressure_map, grid_x, grid_y, map_nx, map_ny)
-        grad_density = compute_gradient_from_map(density_map, grid_x, grid_y, map_nx, map_ny)
+        local_pressure = bilinear_interpolate_rc(pressure_map, gx, gy, map_nx, map_ny)
+        local_density = bilinear_interpolate_rc(density_map, gx, gy, map_nx, map_ny)
+        local_separation = bilinear_interpolate_rc(separation_map, gx, gy, map_nx, map_ny)
+        local_vortex_formation = bilinear_interpolate_rc(vortex_formation_map, gx, gy, map_nx, map_ny)
+        local_wake = bilinear_interpolate_rc(wake_structure_map, gx, gy, map_nx, map_ny)
+        local_shear = bilinear_interpolate_rc(shear_layer_map, gx, gy, map_nx, map_ny)
         
-        # === 2. Λ³構造テンソルの計算（変更なし）===
+        # 物理勾配（環の修正：物理単位で計算）
+        grad_pressure = gradient_from_map_rc(pressure_map, pos[0], pos[1],
+                                            config.domain_width, config.domain_height,
+                                            map_nx, map_ny)
+        grad_density = gradient_from_map_rc(density_map, pos[0], pos[1],
+                                           config.domain_width, config.domain_height,
+                                           map_nx, map_ny)
+        
+        # === 2. Λ³構造テンソルの計算（lax.condで最適化） ===
         neighbor_pos = all_neighbor_positions[i]
         neighbor_Lambda_F = all_neighbor_Lambda_F[i]
         neighbor_Lambda_core = all_neighbor_Lambda_core[i]
@@ -660,13 +697,15 @@ def physics_step_v63(state: ParticleState,
         neighbor_sigma_s = all_neighbor_sigma_s[i]
         neighbor_valid = neighbor_mask[i]
         
-        grad_Lambda = jnp.where(
+        # 重い計算はlax.condで分岐
+        grad_Lambda = lax.cond(
             is_active,
-            compute_Lambda_gradient(
+            lambda _: compute_Lambda_gradient(
                 state.Lambda_F[i], pos,
                 neighbor_Lambda_F, neighbor_pos, neighbor_valid
             ),
-            jnp.eye(2)
+            lambda _: jnp.eye(2),
+            operand=None
         )
         Lambda_core = grad_Lambda.reshape(-1)[:4]
         
@@ -680,28 +719,30 @@ def physics_step_v63(state: ParticleState,
         rho_T = jnp.where(is_active, jnp.linalg.norm(state.Lambda_F[i]), state.rho_T[i])
         
         # 同期率
-        sigma_s = jnp.where(
+        sigma_s = lax.cond(
             is_active,
-            compute_sigma_s(
+            lambda _: compute_sigma_s(
                 state.rho_T[i], state.Lambda_F[i],
                 neighbor_rho_T, neighbor_pos, pos,
                 neighbor_valid
             ),
-            state.sigma_s[i]
+            lambda _: state.sigma_s[i],
+            operand=None
         )
         
         # トポロジカル不変量
-        Q_Lambda = jnp.where(
+        Q_Lambda = lax.cond(
             is_active,
-            compute_local_Q_Lambda(
+            lambda _: compute_local_Q_Lambda(
                 state.Lambda_F[i], pos,
                 neighbor_Lambda_F, neighbor_pos,
                 neighbor_valid
             ),
-            state.Q_Lambda[i]
+            lambda _: state.Q_Lambda[i],
+            operand=None
         )
         
-        # 効率
+        # 効率（環の修正版を使用）
         efficiency = jnp.where(
             is_active,
             compute_efficiency(Lambda_core, state.Lambda_F[i]),
@@ -709,16 +750,17 @@ def physics_step_v63(state: ParticleState,
         )
         
         # === 3. 構造間相互作用 ===
-        structure_force = jnp.where(
+        structure_force = lax.cond(
             is_active,
-            compute_structure_interaction(
+            lambda _: compute_structure_interaction(
                 state.Lambda_F[i], pos, Lambda_core,
                 rho_T, sigma_s,
                 neighbor_Lambda_F, neighbor_pos,
                 neighbor_Lambda_core, neighbor_rho_T, neighbor_sigma_s,
                 neighbor_valid, config
             ),
-            jnp.zeros(2)
+            lambda _: jnp.zeros(2),
+            operand=None
         )
         
         # === 4. ΔΛC検出 ===
@@ -732,39 +774,24 @@ def physics_step_v63(state: ParticleState,
         is_DeltaLambdaC = jnp.where(is_active, is_DeltaLambdaC_active, False)
         event_score = jnp.where(is_active, event_score_active, 0.0)
         
-        # === 5. ΛF更新（純粋な圧力・密度勾配）===
+        # === 5. ΛF更新（環の修正：一本化） ===
+        # 1) 基本的な力
         base_force = -config.thermal_alpha * grad_pressure - config.density_beta * grad_density
-        new_Lambda_F_base = state.Lambda_F[i] + base_force + structure_force
         
-        # ΔΛCイベント時の追加処理
+        # 2) 合成
+        new_Lambda_F = state.Lambda_F[i] + base_force + structure_force
+        
+        # 3) ΔΛCでのみノイズ注入
         subkey = random.fold_in(key, i * 1000)
         DeltaLambdaC_noise = random.normal(subkey, (2,)) * 0.5
         new_Lambda_F = jnp.where(
             is_DeltaLambdaC,
-            new_Lambda_F_base + DeltaLambdaC_noise,
-            new_Lambda_F_base
+            new_Lambda_F + DeltaLambdaC_noise,
+            new_Lambda_F
         )
         
         # === 6. 幾何情報から物理パラメータを再計算 ===
-        # せん断層：局所Reynolds数の調整
-        local_Re_factor = 1.0 + local_shear
-        local_viscosity = config.viscosity_factor / local_Re_factor
-        
-        # 後流：圧力回復
-        pressure_recovery = 1.0 - local_wake * local_wake
-        
         # 剥離判定
-        is_separated = jnp.where(
-            local_separation > 0.5,
-            True,
-            state.is_separated[i]
-        )
-        
-        # 純粋な物理計算（Lambda_core_weight削除！）
-        effective_grad_pressure = grad_pressure * pressure_recovery
-        new_Lambda_F = state.Lambda_F[i] - config.thermal_alpha * effective_grad_pressure - config.density_beta * grad_density + structure_force
-        
-        # 剥離フラグ更新
         is_separated = jnp.where(
             local_separation > 0.5,
             True,
@@ -773,16 +800,17 @@ def physics_step_v63(state: ParticleState,
         
         # トポロジカル保存フィードバック
         feedback_key = random.fold_in(key, i * 6000)
-        new_Lambda_F = jnp.where(
+        new_Lambda_F = lax.cond(
             is_active,
-            apply_topological_feedback(
+            lambda _: apply_topological_feedback(
                 upper_DQ, lower_DQ,
                 new_Lambda_F, efficiency,
                 pos[1], config.obstacle_center_y,
                 is_separated, config,
                 feedback_key
             ),
-            state.Lambda_F[i]
+            lambda _: state.Lambda_F[i],
+            operand=None
         )
         
         # 速度制限
@@ -933,7 +961,7 @@ def inject_particles(state: ParticleState, config: GETWindConfig,
     # 初期温度
     temperatures = 293.0 + 5.0 * (1 - y_positions / config.domain_height)
     
-    # 更新（省略 - v6.2と同じ）
+    # 更新
     new_positions = jnp.where(
         inject_mask[:, None],
         jnp.stack([x_positions, y_positions], axis=1),
@@ -945,8 +973,6 @@ def inject_particles(state: ParticleState, config: GETWindConfig,
         jnp.stack([Lambda_Fx, Lambda_Fy], axis=1),
         state.Lambda_F
     )
-    
-    # 他のフィールドも同様に更新...（省略）
     
     return ParticleState(
         position=new_positions,
@@ -974,12 +1000,13 @@ def inject_particles(state: ParticleState, config: GETWindConfig,
     )
 
 # ==============================
-# メインシミュレーション
+# メインシミュレーション（履歴保存を間引き）
 # ==============================
 
 def run_simulation_v63(map_file: str, config: GETWindConfig, 
-                      seed: int = 42, save_states: bool = True):
-    """GET Wind™ v6.3 メインシミュレーション（幾何MAP駆動）"""
+                      seed: int = 42, save_states: bool = True,
+                      snapshot_interval: int = 50):
+    """GET Wind™ v6.3 メインシミュレーション（幾何MAP駆動・修正版）"""
     
     # 幾何マップ読み込み
     map_data = GeometricMapData(map_file)
@@ -1015,12 +1042,13 @@ def run_simulation_v63(map_file: str, config: GETWindConfig,
     )
     
     print("=" * 70)
-    print("GET Wind™ v6.3 - Geometric Bernoulli Integration")
+    print("GET Wind™ v6.3 - Geometric Bernoulli Integration [FIXED EDITION]")
     print("環ちゃん & ご主人さま Ultimate Geometry Edition! 💕")
     print(f"Map: {map_file}")
     print(f"Max particles: {N}")
     print(f"Steps: {config.n_steps}")
-    print("Features: Pure geometric-driven physics with Λ³ interaction")
+    print(f"Snapshot interval: {snapshot_interval}")
+    print("Features: Fixed coordinate transforms, optimized branches, proper gradients")
     print("=" * 70)
     
     # JITコンパイル
@@ -1075,9 +1103,10 @@ def run_simulation_v63(map_file: str, config: GETWindConfig,
             subkey
         )
         
-        # 状態保存
-        if save_states:
+        # 状態保存（間引き）
+        if save_states and (step % snapshot_interval == 0 or step == config.n_steps - 1):
             state_history.append({
+                'step': step,
                 'position': np.array(state.position),
                 'Lambda_F': np.array(state.Lambda_F),
                 'vorticity': np.array(state.vorticity),
@@ -1119,17 +1148,18 @@ def run_simulation_v63(map_file: str, config: GETWindConfig,
     print("SIMULATION COMPLETE!")
     print(f"Total time: {elapsed:.2f}s")
     print(f"Performance: {config.n_steps / elapsed:.1f} steps/sec")
+    print(f"Saved {len(state_history)} snapshots")
     print("=" * 70)
     
     # 結果保存
     if save_states:
         shape_name = "cylinder" if config.obstacle_shape == 0 else "square"
-        filename = f"simulation_results_v63_{shape_name}.npz"
-        np.savez(filename,
-                states=state_history,
-                history=history,
-                config=config._asdict())
-        print(f"\nResults saved to {filename}")
+        filename = f"simulation_results_v63_fixed_{shape_name}.npz"
+        np.savez_compressed(filename,
+                           states=state_history,
+                           history=history,
+                           config=config._asdict())
+        print(f"\nResults saved to {filename} (compressed)")
     
     return state, history
 
@@ -1172,13 +1202,15 @@ if __name__ == "__main__":
     map_file = f"{shape_name}_Re200_geometric.npz"
     
     print("\n" + "=" * 70)
-    print("GET Wind™ v6.3 - Geometric Bernoulli Edition 🌀")
-    print("Pure geometry-driven fluid dynamics!")
+    print("GET Wind™ v6.3 Fixed - Geometric Bernoulli Edition 🌀")
+    print("With 環's complete patch applied!")
     print("=" * 70)
     
     try:
-        final_state, history = run_simulation_v63(map_file, config, save_states=True)
-        print("\n✨ v6.3 Complete! Physics emerges from geometry! ✨")
+        final_state, history = run_simulation_v63(map_file, config, 
+                                                  save_states=True, 
+                                                  snapshot_interval=50)
+        print("\n✨ v6.3 Fixed Complete! Physics emerges from geometry! ✨")
         
     except FileNotFoundError:
         print(f"\n⚠ Map file '{map_file}' not found!")
