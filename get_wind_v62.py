@@ -25,11 +25,12 @@ jax.config.update("jax_enable_x64", True)
 print(f"JAX backend: {jax.default_backend()}")
 print(f"JAX devices: {jax.devices()}")
 
+SHAPE_CYLINDER = 0
+SHAPE_SQUARE = 1
 # ==============================
 # Configuration
 # ==============================
 # 形状定数
-
 class GETWindConfig(NamedTuple):
     """GET Wind™ v6.2 設定（Λ³ Enhanced + Spatial Coherence）"""
     #  障害物形状
