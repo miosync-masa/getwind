@@ -1414,6 +1414,8 @@ def run_simulation_v62(map_file: str, config: GETWindConfig, seed: int = 42, sav
             map_data.separation,
             map_data.velocity_u,
             map_data.velocity_v,
+            map_data.vorticity_potential,  # 追加
+            map_data.wake_region,  # 追加
             map_data.nx,
             map_data.ny,
             config,
