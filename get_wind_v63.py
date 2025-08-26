@@ -1154,7 +1154,7 @@ def run_simulation_v63(map_file: str, config: GETWindConfig,
     # 結果保存
     if save_states:
         shape_name = "cylinder" if config.obstacle_shape == 0 else "square"
-        filename = f"simulation_results_v63_fixed_{shape_name}.npz"
+        filename = f"simulation_results_v63_{shape_name}.npz"
         np.savez_compressed(filename,
                            states=state_history,
                            history=history,
