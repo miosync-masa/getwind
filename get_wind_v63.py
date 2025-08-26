@@ -1,1217 +1,843 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GET Wind™ v6.3 JAX Edition - Geometric Bernoulli Map Integration [FIXED]
-環ちゃん & ご主人さま Ultimate Geometry Edition! 💕
+GET Wind™ Vortex Analysis - Ultimate Edition
+環ちゃん & ご主人さま Complete Fix! 💕
 
-v6.3 Fixed Edition:
-  - 座標変換とグリッド補間の修正
-  - 物理勾配計算の正確化
-  - compute_efficiencyの行列射影修正
-  - ΛF更新の一本化
-  - lax.condによる分岐最適化
+Ultimate改良版：
+- ファイル名をv6.3に統一
+- 揚力係数の幾何重み追加
+- rFFTによる高速化
+- 自動eps計算
+- Reynolds数の実効値推定
+- Welch法オプション追加
 """
 
-import jax
-import jax.numpy as jnp
-from jax import jit, vmap, lax, random
 import numpy as np
 import matplotlib.pyplot as plt
-from functools import partial
-import time
-from typing import NamedTuple, Tuple, Dict
-
-# JAX設定
-jax.config.update("jax_enable_x64", True)
-print(f"JAX backend: {jax.default_backend()}")
-print(f"JAX devices: {jax.devices()}")
-
-# 形状定数
-SHAPE_CYLINDER = 0
-SHAPE_SQUARE = 1
+from sklearn.cluster import DBSCAN
+from sklearn.neighbors import NearestNeighbors
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import welch
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
 
 # ==============================
-# Configuration
+# データ構造
 # ==============================
 
-class GETWindConfig(NamedTuple):
-    """GET Wind™ v6.3 設定（幾何MAP対応）"""
-    # 障害物形状
-    obstacle_shape: int = 0  # 0=cylinder, 1=square
+@dataclass
+class Vortex:
+    """渦の情報"""
+    center: np.ndarray      # (x, y)
+    n_particles: int        # 粒子数
+    circulation: float      # 循環
+    cluster_id: int        # DBSCANのクラスタID
     
-    # シミュレーション領域
-    domain_width: float = 300.0
-    domain_height: float = 150.0
-    
-    # マップ解像度
-    map_nx: int = 300
-    map_ny: int = 150
-    
-    # Λ³パラメータ（コアは維持！）
-    Lambda_F_inlet: float = 10.0
-    thermal_alpha: float = 0.008      # 温度勾配の重み
-    density_beta: float = 0.015       # 密度勾配の重み
-    structure_coupling: float = 0.025  # 構造結合強度
-    viscosity_factor: float = 40.0     # 粘性係数
-    interaction_strength: float = 0.1  # 粒子間相互作用強度
-    
-    # 効率パラメータ
-    efficiency_threshold: float = 0.1
-    efficiency_weight: float = 0.5
-    
-    # トポロジカルパラメータ
-    topological_threshold: float = 0.1
-    sync_threshold: float = 0.05
-    
-    # 渦検出パラメータ
-    coherence_threshold: float = 0.6
-    circulation_threshold: float = 1.0
-    min_particles_per_region: int = 20
-    vortex_grid_size: float = 10.0
-    
-    # 幾何MAP用パラメータ（新規）
-    shear_instability_strength: float = 0.5   # せん断層不安定性
-    vortex_formation_noise: float = 1.0       # 渦形成領域の乱流強度
-    wake_turbulence_factor: float = 0.8       # 後流乱流係数
-    
-    # 粒子パラメータ
-    particles_per_step: float = 5.0
-    max_particles: int = 1500
-    dt: float = 0.05
-    n_steps: int = 3000
-    
-    # 物理定数
-    obstacle_center_x: float = 100.0
-    obstacle_center_y: float = 75.0
-    obstacle_size: float = 20.0
+@dataclass
+class VortexSnapshot:
+    """1ステップの渦情報"""
+    step: int
+    vortices: List[Vortex]
+    total_particles: int
 
 # ==============================
-# Map Manager (v6.3: 幾何MAP対応)
+# 渦検出（DBSCAN with adaptive eps）
 # ==============================
 
-class GeometricMapData:
-    """幾何学的ベルヌーイマップデータの管理"""
-    
-    def __init__(self, npz_file: str):
-        """NPZファイルから幾何MAPを読み込み"""
-        print(f"Loading geometric map from {npz_file}...")
-        data = np.load(npz_file)
-        
-        # 幾何学的フィールド
-        self.stream_function = jnp.array(data['stream_function'])
-        self.pressure = jnp.array(data['pressure'])
-        self.density = jnp.array(data['density'])
-        self.separation = jnp.array(data['separation'])
-        self.vortex_formation = jnp.array(data['vortex_formation'])
-        self.wake_structure = jnp.array(data['wake_structure'])
-        self.shear_layer = jnp.array(data['shear_layer'])
-        
-        # グリッド情報（環の修正：shape順序を明確化）
-        self.nx, self.ny = self.pressure.shape  # (cols, rows)
-        
-        print(f"Geometric map loaded: {self.nx}x{self.ny} (cols x rows)")
-        print(f"  Available fields: stream_function, pressure, density,")
-        print(f"                   separation, vortex_formation,")
-        print(f"                   wake_structure, shear_layer")
-
-# ==============================
-# Particle State（変更なし）
-# ==============================
-
-class ParticleState(NamedTuple):
-    """粒子状態（v6.3: 変更なし）"""
-    # 基本状態
-    position: jnp.ndarray       # (N, 2) 位置
-    Lambda_F: jnp.ndarray       # (N, 2) 進行ベクトル
-    Lambda_FF: jnp.ndarray      # (N, 2) 加速度
-    prev_Lambda_F: jnp.ndarray  # (N, 2) 前の進行ベクトル
-    
-    # Λ³構造テンソル
-    Lambda_core: jnp.ndarray    # (N, 4) 速度勾配テンソル（2x2を平坦化）
-    rho_T: jnp.ndarray          # (N,) テンション密度
-    sigma_s: jnp.ndarray        # (N,) 同期率
-    prev_sigma_s: jnp.ndarray   # (N,) 前の同期率
-    Q_Lambda: jnp.ndarray       # (N,) トポロジカル不変量
-    prev_Q_Lambda: jnp.ndarray  # (N,) 前のトポロジカル不変量
-    
-    # 効率と評価
-    efficiency: jnp.ndarray     # (N,) 構造効率
-    emergence: jnp.ndarray      # (N,) 創発度
-    
-    # 物理量
-    temperature: jnp.ndarray    # (N,) 温度
-    density: jnp.ndarray        # (N,) 密度
-    vorticity: jnp.ndarray      # (N,) 渦度
-    Q_criterion: jnp.ndarray    # (N,) Q判定基準
-    
-    # イベント検出
-    DeltaLambdaC: jnp.ndarray   # (N,) ΔΛCイベント
-    event_score: jnp.ndarray    # (N,) イベントスコア
-    
-    # 管理用
-    age: jnp.ndarray           # (N,) 年齢
-    is_active: jnp.ndarray     # (N,) アクティブフラグ
-    is_separated: jnp.ndarray   # (N,) 剥離フラグ
-    near_wall: jnp.ndarray      # (N,) 壁近傍フラグ
-
-# ==============================
-# 補間処理（環の修正版：座標変換と行列順序対応）
-# ==============================
-
-@jit
-def world_to_grid(x: float, y: float, 
-                  domain_w: float, domain_h: float, 
-                  nx: int, ny: int) -> Tuple[float, float]:
-    """物理座標→グリッド座標変換"""
-    gx = (x / (domain_w + 1e-8)) * (nx - 1)
-    gy = (y / (domain_h + 1e-8)) * (ny - 1)
-    gx = jnp.clip(gx, 0.0, nx - 1.0)
-    gy = jnp.clip(gy, 0.0, ny - 1.0)
-    return gx, gy
-
-@jit
-def bilinear_interpolate_rc(field: jnp.ndarray, 
-                            gx: float, gy: float, 
-                            nx: int, ny: int) -> float:
-    """バイリニア補間（row-column順序対応）"""
-    # gx, gy は [0, nx-1], [0, ny-1] のグリッド座標
-    j = jnp.clip(jnp.floor(gx).astype(int), 0, nx - 2)  # col (=x)
-    i = jnp.clip(jnp.floor(gy).astype(int), 0, ny - 2)  # row (=y)
-    
-    fx = gx - j
-    fy = gy - i
-    
-    # field[row, col] = field[y, x] の順序に注意
-    v00 = field[j, i]      # field[x, y]
-    v10 = field[j + 1, i]
-    v01 = field[j, i + 1]
-    v11 = field[j + 1, i + 1]
-    
-    return (1-fx)*(1-fy)*v00 + fx*(1-fy)*v10 + (1-fx)*fy*v01 + fx*fy*v11
-
-@jit
-def gradient_from_map_rc(field: jnp.ndarray, 
-                        x: float, y: float,
-                        domain_w: float, domain_h: float, 
-                        nx: int, ny: int) -> jnp.ndarray:
-    """物理勾配計算（正確なスケーリング付き）"""
-    dx = domain_w / (nx - 1)
-    dy = domain_h / (ny - 1)
-    
-    gx, gy = world_to_grid(x, y, domain_w, domain_h, nx, ny)
-    
-    # 中心差分を格子空間で
-    val_xp = bilinear_interpolate_rc(field, 
-                                     jnp.minimum(gx + 1.0, nx - 1.0), gy, 
-                                     nx, ny)
-    val_xm = bilinear_interpolate_rc(field, 
-                                     jnp.maximum(gx - 1.0, 0.0), gy, 
-                                     nx, ny)
-    val_yp = bilinear_interpolate_rc(field, 
-                                     gx, jnp.minimum(gy + 1.0, ny - 1.0), 
-                                     nx, ny)
-    val_ym = bilinear_interpolate_rc(field, 
-                                     gx, jnp.maximum(gy - 1.0, 0.0), 
-                                     nx, ny)
-    
-    dfdx = (val_xp - val_xm) / (2.0 * dx)
-    dfdy = (val_yp - val_ym) / (2.0 * dy)
-    
-    return jnp.array([dfdx, dfdy])
-
-# ==============================
-# Λ³構造テンソル計算（環の修正版：効率計算改良）
-# ==============================
-
-@jit
-def compute_Lambda_gradient(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
-                           neighbor_Lambda_F: jnp.ndarray,
-                           neighbor_positions: jnp.ndarray,
-                           neighbor_mask: jnp.ndarray) -> jnp.ndarray:
-    """ΛF勾配テンソル（Lambda_core）"""
-    dr = neighbor_positions - pos_i
-    dLambda = neighbor_Lambda_F - Lambda_F_i
-    
-    valid = neighbor_mask & (jnp.linalg.norm(dr, axis=1) > 0.01)
-    
-    # 最小二乗法で勾配を推定
-    A = jnp.where(valid[:, None], dr, 0)
-    b_u = jnp.where(valid, dLambda[:, 0], 0)
-    b_v = jnp.where(valid, dLambda[:, 1], 0)
-    
-    ATA = A.T @ A + jnp.eye(2) * 1e-8
-    grad_u = jnp.linalg.solve(ATA, A.T @ b_u)
-    grad_v = jnp.linalg.solve(ATA, A.T @ b_v)
-    
-    return jnp.array([[grad_u[0], grad_u[1]], [grad_v[0], grad_v[1]]])
-
-@jit
-def compute_vortex_quantities(grad_Lambda: jnp.ndarray) -> Tuple[float, float, float]:
-    """渦量計算（S, Ω, Q, λ2）"""
-    S = 0.5 * (grad_Lambda + grad_Lambda.T)  # 歪み速度テンソル
-    Omega = 0.5 * (grad_Lambda - grad_Lambda.T)  # 渦度テンソル
-    
-    # Q判定基準
-    Q = 0.5 * (jnp.trace(Omega @ Omega.T) - jnp.trace(S @ S.T))
-    
-    # λ2基準
-    S2_Omega2 = S @ S + Omega @ Omega
-    eigenvalues = jnp.linalg.eigvalsh(S2_Omega2)
-    lambda2 = eigenvalues[0]
-    
-    # 渦度
-    vorticity = grad_Lambda[1, 0] - grad_Lambda[0, 1]
-    
-    return Q, lambda2, vorticity
-
-@jit
-def compute_efficiency(Lambda_core_flat: jnp.ndarray, Lambda_F: jnp.ndarray) -> float:
-    """構造の効率計算（環の修正版：行列-ベクトル射影）"""
-    G = Lambda_core_flat.reshape(2, 2)
-    v = Lambda_F
-    vn = jnp.linalg.norm(v) + 1e-8
-    
-    # Gがvをどれだけ伸縮/回転させるかのv方向成分
-    Gv = G @ v
-    proj_mag = jnp.dot(Gv, v) / vn
-    
-    # 構造の一貫性
-    coherence = jnp.exp(-jnp.var(G))
-    
-    return jnp.abs(proj_mag) * coherence
-
-@jit
-def compute_sigma_s(rho_T_i: float, Lambda_F_i: jnp.ndarray,
-                   neighbor_rho_T: jnp.ndarray,
-                   neighbor_positions: jnp.ndarray, pos_i: jnp.ndarray,
-                   neighbor_mask: jnp.ndarray) -> float:
-    """同期率σₛの計算"""
-    dr = neighbor_positions - pos_i
-    distances = jnp.linalg.norm(dr, axis=1) + 1e-8
-    
-    valid = neighbor_mask & (distances < 10.0)
-    
-    # テンション密度の勾配
-    drho = neighbor_rho_T - rho_T_i
-    grad_rho_T = jnp.sum(
-        jnp.where(valid[:, None], (drho[:, None] / distances[:, None]**2) * dr, 0),
-        axis=0
-    ) / jnp.maximum(jnp.sum(valid), 1)
-    
-    # ΛFとの同期
-    numerator = jnp.dot(grad_rho_T, Lambda_F_i)
-    denominator = jnp.linalg.norm(grad_rho_T) * jnp.linalg.norm(Lambda_F_i) + 1e-8
-    
-    return numerator / denominator
-
-@jit
-def compute_local_Q_Lambda(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
-                          neighbor_Lambda_F: jnp.ndarray,
-                          neighbor_positions: jnp.ndarray,
-                          neighbor_mask: jnp.ndarray) -> float:
-    """局所トポロジカルチャージQ_Λ（循環の計算）"""
-    valid = neighbor_mask & (jnp.linalg.norm(neighbor_positions - pos_i, axis=1) < 10.0)
-    
-    rel_pos = neighbor_positions - pos_i
-    
-    def compute_contribution(idx):
-        is_valid = valid[idx]
-        Lambda_vec = neighbor_Lambda_F[idx]
-        r_vec = rel_pos[idx]
-        r_norm = jnp.linalg.norm(r_vec) + 1e-8
-        
-        # 接線方向（反時計回り）
-        tangent = jnp.array([-r_vec[1], r_vec[0]]) / r_norm
-        
-        # 循環への寄与（速度と接線の内積）
-        circulation_contrib = jnp.dot(Lambda_vec, tangent)
-        
-        # 角度の重み（近い粒子ほど重要）
-        weight = jnp.exp(-r_norm / 5.0)
-        
-        return jnp.where(is_valid, circulation_contrib * weight, 0.0)
-    
-    # 重み付き循環
-    weighted_circulation = jnp.sum(vmap(compute_contribution)(jnp.arange(len(neighbor_positions))))
-    
-    # 重みの合計で正規化
-    total_weight = jnp.sum(jnp.where(valid, jnp.exp(-jnp.linalg.norm(rel_pos, axis=1) / 5.0), 0.0))
-    
-    # 循環を正規化（-π〜πの範囲）
-    normalized_circulation = jnp.where(
-        total_weight > 0.1,
-        weighted_circulation / (total_weight + 1e-8),
-        0.0
-    )
-    
-    # 角度として返す（-π〜π）
-    return jnp.clip(normalized_circulation, -jnp.pi, jnp.pi)
-
-# ==============================
-# ΔΛC検出（変更なし）
-# ==============================
-
-@jit
-def detect_DeltaLambdaC(efficiency: float, prev_efficiency: float,
-                       sigma_s: float, prev_sigma_s: float,
-                       Q_Lambda: float, prev_Q_Lambda: float,
-                       Q: float, lambda2: float, vorticity: float,
-                       config: GETWindConfig) -> Tuple[bool, float]:
-    """ΔΛC検出（構造変化点）"""
-    score = 0.0
-    
-    # 効率の急変
-    eff_change = jnp.abs(efficiency - prev_efficiency) / (jnp.abs(prev_efficiency) + 1e-8)
-    score += jnp.where(eff_change > 0.5, 2.0, 0.0)
-    
-    # 同期率の急変
-    sigma_jump = jnp.abs(sigma_s - prev_sigma_s)
-    score += jnp.where(sigma_jump > config.sync_threshold, 1.5, 0.0)
-    
-    # トポロジカルジャンプ
-    Q_jump = jnp.abs(Q_Lambda - prev_Q_Lambda)
-    score += jnp.where(Q_jump > config.topological_threshold, 2.0, 0.0)
-    
-    # 渦判定
-    score += jnp.where(Q > 0.1, 1.0, 0.0)
-    score += jnp.where(lambda2 < -0.01, 1.0, 0.0)
-    score += jnp.where(jnp.abs(vorticity) > 0.5, 1.0, 0.0)
-    
-    # ΔΛCイベント判定
-    is_event = score >= 2.0
-    
-    return is_event, score
-
-# ==============================
-# 構造間相互作用（変更なし！重要！）
-# ==============================
-
-@jit
-def compute_structure_interaction(Lambda_F_i: jnp.ndarray, pos_i: jnp.ndarray,
-                                 Lambda_core_i: jnp.ndarray,
-                                 rho_T_i: float, sigma_s_i: float,
-                                 neighbor_Lambda_F: jnp.ndarray,
-                                 neighbor_positions: jnp.ndarray,
-                                 neighbor_Lambda_core: jnp.ndarray,
-                                 neighbor_rho_T: jnp.ndarray,
-                                 neighbor_sigma_s: jnp.ndarray,
-                                 neighbor_mask: jnp.ndarray,
-                                 config: GETWindConfig) -> jnp.ndarray:
-    """構造間相互作用（Λ³ Enhanced + 段階的減衰）"""
-    
-    # 障害物からの距離
-    distance_from_obstacle_x = pos_i[0] - config.obstacle_center_x
-    
-    # 段階的減衰
-    decay_factor = jnp.where(
-        distance_from_obstacle_x < 100.0,
-        1.0,
-        jnp.where(
-            distance_from_obstacle_x < 200.0,
-            jnp.exp(-(distance_from_obstacle_x - 100.0) / 50.0),
-            0.0
-        )
-    )
-    
-    dr = neighbor_positions - pos_i
-    distances = jnp.linalg.norm(dr, axis=1) + 1e-8
-    
-    # 相互作用範囲
-    near_range = neighbor_mask & (distances < 15.0)
-    far_range = neighbor_mask & (distances < 30.0)
-    
-    # 近傍粒子も減衰を考慮
-    neighbor_decay = jnp.where(
-        (neighbor_positions[:, 0] - config.obstacle_center_x) < 100.0,
-        1.0,
-        jnp.where(
-            (neighbor_positions[:, 0] - config.obstacle_center_x) < 200.0,
-            jnp.exp(-((neighbor_positions[:, 0] - config.obstacle_center_x) - 100.0) / 50.0),
-            0.0
-        )
-    )
-    
-    # 平均減衰率を計算
-    combined_decay = jnp.sqrt(decay_factor * neighbor_decay)
-    
-    # === 1. テンション密度の勾配による力 ===
-    drho = neighbor_rho_T - rho_T_i
-    grad_rho_force = jnp.sum(
-        jnp.where(near_range[:, None], 
-                  (drho[:, None] / distances[:, None]**2) * dr * config.density_beta * combined_decay[:, None],
-                  0),
-        axis=0
-    )
-    
-    # === 2. 構造テンソルの差による力 ===
-    Lambda_core_2x2 = Lambda_core_i.reshape(2, 2)
-    
-    def compute_tensor_force(idx):
-        neighbor_core_2x2 = neighbor_Lambda_core[idx].reshape(2, 2)
-        
-        # テンソル差のノルム
-        tensor_diff = neighbor_core_2x2 - Lambda_core_2x2
-        diff_norm = jnp.linalg.norm(tensor_diff, 'fro')
-        
-        # 構造の不一致による反発/引力
-        direction = dr[idx] / distances[idx]
-        force_mag = diff_norm * jnp.exp(-distances[idx] / 15.0)
-        
-        # 同期率で重み付け
-        sync_weight = 1.0 + (neighbor_sigma_s[idx] - sigma_s_i)
-        
-        force = direction * force_mag * sync_weight * config.structure_coupling
-        
-        return jnp.where(near_range[idx], force, jnp.zeros(2))
-    
-    tensor_forces = vmap(compute_tensor_force)(jnp.arange(len(neighbor_positions)))
-    tensor_force = jnp.sum(tensor_forces, axis=0)
-    
-    # === 3. 渦的相互作用 ===
-    vorticity_i = Lambda_core_2x2[1, 0] - Lambda_core_2x2[0, 1]
-    
-    # 3a. 基本的な渦の回転力（近距離）
-    tangent = jnp.stack([-dr[:, 1], dr[:, 0]], axis=1) / distances[:, None]
-    
-    vortex_rotation = jnp.sum(
-        jnp.where(
-            near_range[:, None],
-            tangent * vorticity_i * jnp.exp(-distances[:, None] / 15.0) * 0.2,
-            0
-        ),
-        axis=0
-    )
-    
-    # 3b. 同回転渦の結合力（遠距離まで作用）
-    def compute_vortex_merging(idx):
-        # 近傍の渦度
-        neighbor_vorticity = neighbor_Lambda_core[idx].reshape(2, 2)[1, 0] - \
-                           neighbor_Lambda_core[idx].reshape(2, 2)[0, 1]
-        
-        # 同じ回転方向かチェック
-        same_rotation = vorticity_i * neighbor_vorticity > 0
-        
-        # 渦度の強さに比例した引力（同回転のみ）
-        attraction = jnp.abs(neighbor_vorticity * vorticity_i) * same_rotation
-        
-        # 距離に応じた減衰
-        r = distances[idx]
-        force_mag = attraction * jnp.exp(-r / 25.0) * (1 - jnp.exp(-r / 3.0))
-        
-        # 引力の方向
-        direction = dr[idx] / r
-        
-        return jnp.where(far_range[idx] & same_rotation, direction * force_mag * 0.15, jnp.zeros(2))
-    
-    vortex_merging = jnp.sum(
-        vmap(compute_vortex_merging)(jnp.arange(len(neighbor_positions))),
-        axis=0
-    )
-    
-    # 渦力の合計
-    vortex_force = vortex_rotation + vortex_merging
-    
-    # === 4. 粘性的相互作用 ===
-    mean_Lambda_F = jnp.sum(
-        jnp.where(near_range[:, None], neighbor_Lambda_F, 0),
-        axis=0
-    ) / jnp.maximum(jnp.sum(near_range), 1)
-    
-    # 粘性を渦度に応じて調整
-    vorticity_factor = jnp.exp(-jnp.abs(vorticity_i) / 2.0)
-    effective_viscosity = jnp.minimum(config.viscosity_factor * 0.05 * vorticity_factor, 0.2)
-    viscous_force = effective_viscosity * (mean_Lambda_F - Lambda_F_i)
-    
-    # === 5. 全体の力を合成 ===
-    total_interaction = grad_rho_force + tensor_force + vortex_force + viscous_force
-    
-    # 全体に減衰を適用
-    total_interaction = total_interaction * decay_factor
-    
-    # 相互作用力の大きさを制限
-    max_interaction = 5.0
-    interaction_norm = jnp.linalg.norm(total_interaction)
-    total_interaction = jnp.where(
-        interaction_norm > max_interaction,
-        total_interaction * max_interaction / interaction_norm,
-        total_interaction
-    )
-    
-    return total_interaction
-
-# ==============================
-# トポロジカル保存フィードバック（変更なし）
-# ==============================
-
-@jit
-def apply_topological_feedback(upper_DQ: float, lower_DQ: float,
-                              Lambda_F: jnp.ndarray, 
-                              efficiency: float,
-                              y: float, center_y: float,
-                              is_separated: bool,
-                              config: GETWindConfig,
-                              key: random.PRNGKey) -> jnp.ndarray:
-    """トポロジカル保存フィードバック（改良版）"""
-    # トポロジカルインバランス
-    Q_imbalance = upper_DQ + lower_DQ
-    
-    # インバランスが大きい場合に補正
-    strong_imbalance = jnp.abs(Q_imbalance) > 0.5
-    
-    y_rel = y - center_y
-    
-    # 効率が低い場合は補正を強める
-    efficiency_factor = jnp.where(efficiency < config.efficiency_threshold, 1.5, 1.0)
-    
-    # 補正が必要な条件
-    should_correct_upper = (
-        strong_imbalance & ~is_separated & 
-        (Q_imbalance > 0) & (y_rel > 0)
-    )
-    should_correct_lower = (
-        strong_imbalance & ~is_separated & 
-        (Q_imbalance < 0) & (y_rel < 0)
-    )
-    
-    # 補正の強さ
-    correction_strength = jnp.tanh(jnp.abs(Q_imbalance) / jnp.pi) * efficiency_factor
-    
-    # 速度の向きを調整
-    y_correction = jnp.where(
-        should_correct_upper,
-        -correction_strength * 2.0,
-        jnp.where(
-            should_correct_lower,
-            correction_strength * 2.0,
-            0.0
-        )
-    )
-    
-    # ランダムな摂動も追加
-    random_factor = random.normal(key, (2,)) * 0.02
-    
-    new_Lambda_F = Lambda_F + jnp.array([0.0, y_correction]) + random_factor
-    
-    # 速度の大きさは保存
-    original_norm = jnp.linalg.norm(Lambda_F) + 1e-8
-    new_norm = jnp.linalg.norm(new_Lambda_F) + 1e-8
-    new_Lambda_F = new_Lambda_F * (original_norm / new_norm)
-    
-    return new_Lambda_F
-
-# ==============================
-# 近傍探索（変更なし）
-# ==============================
-
-@partial(jit, static_argnums=(2,))
-def find_neighbors(positions: jnp.ndarray, active_mask: jnp.ndarray,
-                   max_neighbors: int = 20):
-    """近傍粒子を探索"""
-    N = positions.shape[0]
-    
-    pos_i = positions[:, None, :]
-    pos_j = positions[None, :, :]
-    distances = jnp.linalg.norm(pos_i - pos_j, axis=2)
-    
-    mask = active_mask[None, :] & active_mask[:, None]
-    mask = mask & (distances > 0)
-    distances = jnp.where(mask, distances, jnp.inf)
-    
-    sorted_indices = jnp.argsort(distances, axis=1)
-    sorted_distances = jnp.sort(distances, axis=1)
-    
-    neighbor_indices = sorted_indices[:, :max_neighbors]
-    neighbor_distances = sorted_distances[:, :max_neighbors]
-    neighbor_mask = neighbor_distances < 15.0
-    
-    return neighbor_indices, neighbor_mask
-
-# ==============================
-# メイン物理ステップ（v6.3 Fixed: 環の修正適用）
-# ==============================
-
-@partial(jit, static_argnums=(7, 8))
-def physics_step_v63(state: ParticleState,
-                    pressure_map: jnp.ndarray,
-                    density_map: jnp.ndarray,
-                    separation_map: jnp.ndarray,
-                    vortex_formation_map: jnp.ndarray,
-                    wake_structure_map: jnp.ndarray,
-                    shear_layer_map: jnp.ndarray,
-                    map_nx: int, map_ny: int,
-                    config: GETWindConfig,
-                    key: random.PRNGKey) -> ParticleState:
-    """v6.3の物理ステップ（幾何MAP駆動・修正版）"""
-    
-    active_mask = state.is_active
-    N = state.position.shape[0]
-    
-    # 近傍探索
-    neighbor_indices, neighbor_mask = find_neighbors(state.position, active_mask)
-    
-    # トポロジカル統計
-    y_rel_all = state.position[:, 1] - config.obstacle_center_y
-    upper_sep = state.is_separated & active_mask & (y_rel_all > 0)
-    lower_sep = state.is_separated & active_mask & (y_rel_all <= 0)
-    
-    upper_DQ = jnp.sum(jnp.where(upper_sep, state.Q_Lambda, 0.0))
-    lower_DQ = jnp.sum(jnp.where(lower_sep, state.Q_Lambda, 0.0))
-    
-    # 近傍データ準備
-    all_neighbor_positions = state.position[neighbor_indices]
-    all_neighbor_Lambda_F = state.Lambda_F[neighbor_indices]
-    all_neighbor_Lambda_core = state.Lambda_core[neighbor_indices]
-    all_neighbor_rho_T = state.rho_T[neighbor_indices]
-    all_neighbor_sigma_s = state.sigma_s[neighbor_indices]
-    
-    def update_particle(i):
-        """各粒子の更新"""
-        is_active = active_mask[i]
-        pos = state.position[i]
-        
-        # === 1. 座標変換と幾何MAPから場を取得（環の修正） ===
-        gx, gy = world_to_grid(pos[0], pos[1], 
-                               config.domain_width, config.domain_height, 
-                               map_nx, map_ny)
-        
-        local_pressure = bilinear_interpolate_rc(pressure_map, gx, gy, map_nx, map_ny)
-        local_density = bilinear_interpolate_rc(density_map, gx, gy, map_nx, map_ny)
-        local_separation = bilinear_interpolate_rc(separation_map, gx, gy, map_nx, map_ny)
-        local_vortex_formation = bilinear_interpolate_rc(vortex_formation_map, gx, gy, map_nx, map_ny)
-        local_wake = bilinear_interpolate_rc(wake_structure_map, gx, gy, map_nx, map_ny)
-        local_shear = bilinear_interpolate_rc(shear_layer_map, gx, gy, map_nx, map_ny)
-        
-        # 物理勾配（環の修正：物理単位で計算）
-        grad_pressure = gradient_from_map_rc(pressure_map, pos[0], pos[1],
-                                            config.domain_width, config.domain_height,
-                                            map_nx, map_ny)
-        grad_density = gradient_from_map_rc(density_map, pos[0], pos[1],
-                                           config.domain_width, config.domain_height,
-                                           map_nx, map_ny)
-        
-        # === 2. Λ³構造テンソルの計算（lax.condで最適化） ===
-        neighbor_pos = all_neighbor_positions[i]
-        neighbor_Lambda_F = all_neighbor_Lambda_F[i]
-        neighbor_Lambda_core = all_neighbor_Lambda_core[i]
-        neighbor_rho_T = all_neighbor_rho_T[i]
-        neighbor_sigma_s = all_neighbor_sigma_s[i]
-        neighbor_valid = neighbor_mask[i]
-        
-        # 重い計算はlax.condで分岐
-        grad_Lambda = lax.cond(
-            is_active,
-            lambda _: compute_Lambda_gradient(
-                state.Lambda_F[i], pos,
-                neighbor_Lambda_F, neighbor_pos, neighbor_valid
-            ),
-            lambda _: jnp.eye(2),
-            operand=None
-        )
-        Lambda_core = grad_Lambda.reshape(-1)[:4]
-        
-        # 渦量計算
-        Q_active, lambda2_active, vorticity_active = compute_vortex_quantities(grad_Lambda)
-        Q = jnp.where(is_active, Q_active, 0.0)
-        lambda2 = jnp.where(is_active, lambda2_active, 0.0)
-        vorticity = jnp.where(is_active, vorticity_active, 0.0)
-        
-        # テンション密度
-        rho_T = jnp.where(is_active, jnp.linalg.norm(state.Lambda_F[i]), state.rho_T[i])
-        
-        # 同期率
-        sigma_s = lax.cond(
-            is_active,
-            lambda _: compute_sigma_s(
-                state.rho_T[i], state.Lambda_F[i],
-                neighbor_rho_T, neighbor_pos, pos,
-                neighbor_valid
-            ),
-            lambda _: state.sigma_s[i],
-            operand=None
-        )
-        
-        # トポロジカル不変量
-        Q_Lambda = lax.cond(
-            is_active,
-            lambda _: compute_local_Q_Lambda(
-                state.Lambda_F[i], pos,
-                neighbor_Lambda_F, neighbor_pos,
-                neighbor_valid
-            ),
-            lambda _: state.Q_Lambda[i],
-            operand=None
-        )
-        
-        # 効率（環の修正版を使用）
-        efficiency = jnp.where(
-            is_active,
-            compute_efficiency(Lambda_core, state.Lambda_F[i]),
-            state.efficiency[i]
-        )
-        
-        # === 3. 構造間相互作用 ===
-        structure_force = lax.cond(
-            is_active,
-            lambda _: compute_structure_interaction(
-                state.Lambda_F[i], pos, Lambda_core,
-                rho_T, sigma_s,
-                neighbor_Lambda_F, neighbor_pos,
-                neighbor_Lambda_core, neighbor_rho_T, neighbor_sigma_s,
-                neighbor_valid, config
-            ),
-            lambda _: jnp.zeros(2),
-            operand=None
-        )
-        
-        # === 4. ΔΛC検出 ===
-        is_DeltaLambdaC_active, event_score_active = detect_DeltaLambdaC(
-            efficiency, state.efficiency[i],
-            sigma_s, state.sigma_s[i],
-            Q_Lambda, state.Q_Lambda[i],
-            Q, lambda2, vorticity,
-            config
-        )
-        is_DeltaLambdaC = jnp.where(is_active, is_DeltaLambdaC_active, False)
-        event_score = jnp.where(is_active, event_score_active, 0.0)
-        
-        # === 5. ΛF更新（環の修正：一本化） ===
-        # 1) 基本的な力
-        base_force = -config.thermal_alpha * grad_pressure - config.density_beta * grad_density
-        
-        # 2) 合成
-        new_Lambda_F = state.Lambda_F[i] + base_force + structure_force
-        
-        # 3) ΔΛCでのみノイズ注入
-        subkey = random.fold_in(key, i * 1000)
-        DeltaLambdaC_noise = random.normal(subkey, (2,)) * 0.5
-        new_Lambda_F = jnp.where(
-            is_DeltaLambdaC,
-            new_Lambda_F + DeltaLambdaC_noise,
-            new_Lambda_F
-        )
-        
-        # === 6. 幾何情報から物理パラメータを再計算 ===
-        # 剥離判定
-        is_separated = jnp.where(
-            local_separation > 0.5,
-            True,
-            state.is_separated[i]
-        )
-        
-        # トポロジカル保存フィードバック
-        feedback_key = random.fold_in(key, i * 6000)
-        new_Lambda_F = lax.cond(
-            is_active,
-            lambda _: apply_topological_feedback(
-                upper_DQ, lower_DQ,
-                new_Lambda_F, efficiency,
-                pos[1], config.obstacle_center_y,
-                is_separated, config,
-                feedback_key
-            ),
-            lambda _: state.Lambda_F[i],
-            operand=None
-        )
-        
-        # 速度制限
-        max_velocity = config.Lambda_F_inlet * 1.5
-        new_Lambda_F = jnp.clip(new_Lambda_F, -max_velocity, max_velocity)
-        
-        # ΛFF（加速度）
-        new_Lambda_FF = jnp.where(
-            is_active,
-            (new_Lambda_F - state.Lambda_F[i]) / config.dt,
-            state.Lambda_FF[i]
-        )
-        
-        # === 7. 物理量更新 ===
-        temp_noise = random.normal(random.fold_in(key, i * 7000)) * 2.0
-        new_temperature = state.temperature[i] + jnp.where(
-            is_DeltaLambdaC,
-            temp_noise,
-            0.0
-        )
-        new_temperature = jnp.clip(new_temperature, 285.0, 305.0)
-        
-        new_density = jnp.where(
-            is_active,
-            local_density * (1.0 + 0.1 * jnp.sin(Q_Lambda)),
-            state.density[i]
-        )
-        
-        # 創発度（幾何構造からの逸脱）
-        emergence = jnp.where(
-            is_active,
-            jnp.tanh(jnp.linalg.norm(structure_force) / 5.0),
-            state.emergence[i]
-        )
-        
-        # 障害物からの距離
-        particle_dx = pos[0] - config.obstacle_center_x
-        particle_dy = pos[1] - config.obstacle_center_y
-        particle_r = jnp.sqrt(particle_dx**2 + particle_dy**2)
-        
-        near_wall = (particle_r > config.obstacle_size) & (particle_r < config.obstacle_size + 5.0)
-        
-        return (
-            jnp.where(is_active, new_Lambda_F, state.Lambda_F[i]),
-            jnp.where(is_active, new_Lambda_FF, state.Lambda_FF[i]),
-            jnp.where(is_active, state.Lambda_F[i], state.prev_Lambda_F[i]),
-            jnp.where(is_active, Lambda_core, state.Lambda_core[i]),
-            jnp.where(is_active, rho_T, state.rho_T[i]),
-            jnp.where(is_active, sigma_s, state.sigma_s[i]),
-            jnp.where(is_active, Q_Lambda, state.Q_Lambda[i]),
-            jnp.where(is_active, efficiency, state.efficiency[i]),
-            jnp.where(is_active, emergence, state.emergence[i]),
-            jnp.where(is_active, new_temperature, state.temperature[i]),
-            jnp.where(is_active, new_density, state.density[i]),
-            jnp.where(is_active, vorticity, state.vorticity[i]),
-            jnp.where(is_active, Q, state.Q_criterion[i]),
-            jnp.where(is_active, is_DeltaLambdaC, state.DeltaLambdaC[i]),
-            jnp.where(is_active, event_score, state.event_score[i]),
-            jnp.where(is_active, is_separated, state.is_separated[i]),
-            jnp.where(is_active, near_wall, state.near_wall[i])
-        )
-    
-    # 全粒子を並列更新
-    results = vmap(update_particle)(jnp.arange(N))
-    
-    # 結果を展開
-    new_Lambda_F = results[0]
-    new_Lambda_FF = results[1]
-    new_prev_Lambda_F = results[2]
-    new_Lambda_core = results[3]
-    new_rho_T = results[4]
-    new_sigma_s = results[5]
-    new_Q_Lambda = results[6]
-    new_efficiency = results[7]
-    new_emergence = results[8]
-    new_temperature = results[9]
-    new_density = results[10]
-    new_vorticity = results[11]
-    new_Q_criterion = results[12]
-    new_DeltaLambdaC = results[13]
-    new_event_score = results[14]
-    new_is_separated = results[15]
-    new_near_wall = results[16]
-    
-    # 位置更新
-    new_positions = state.position + new_Lambda_F * config.dt
-    
-    # 年齢更新
-    new_age = state.age + jnp.where(active_mask, 1.0, 0.0)
-    
-    # 境界チェック
-    new_active = active_mask & (new_positions[:, 0] < config.domain_width)
-    
-    return ParticleState(
-        position=new_positions,
-        Lambda_F=new_Lambda_F,
-        Lambda_FF=new_Lambda_FF,
-        prev_Lambda_F=new_prev_Lambda_F,
-        Lambda_core=new_Lambda_core,
-        rho_T=new_rho_T,
-        sigma_s=new_sigma_s,
-        prev_sigma_s=state.sigma_s,
-        Q_Lambda=new_Q_Lambda,
-        prev_Q_Lambda=state.Q_Lambda,
-        efficiency=new_efficiency,
-        emergence=new_emergence,
-        temperature=new_temperature,
-        density=new_density,
-        vorticity=new_vorticity,
-        Q_criterion=new_Q_criterion,
-        DeltaLambdaC=new_DeltaLambdaC,
-        event_score=new_event_score,
-        age=new_age,
-        is_active=new_active,
-        is_separated=new_is_separated,
-        near_wall=new_near_wall
-    )
-
-# ==============================
-# 粒子注入（変更なし）
-# ==============================
-
-def inject_particles(state: ParticleState, config: GETWindConfig,
-                    key: random.PRNGKey, step: int) -> ParticleState:
-    """新粒子の注入"""
-    key1, key2, key3 = random.split(key, 3)
-    
-    n_inject_float = random.poisson(key1, config.particles_per_step)
-    n_inject = jnp.minimum(jnp.int32(n_inject_float), 10)
-    
-    inactive_mask = ~state.is_active
-    inactive_count = jnp.sum(inactive_mask)
-    
-    n_to_inject = jnp.minimum(n_inject, inactive_count)
-    
-    cumsum = jnp.cumsum(jnp.where(inactive_mask, 1, 0))
-    inject_mask = (cumsum <= n_to_inject) & inactive_mask
-    
-    N = state.position.shape[0]
-    
-    # 新しい位置とΛF
-    y_positions = random.uniform(key2, (N,), minval=5, maxval=config.domain_height-5)
-    x_positions = random.uniform(key3, (N,), minval=0, maxval=5)
-    
-    Lambda_Fx = jnp.ones(N) * config.Lambda_F_inlet + random.normal(key2, (N,)) * 0.1
-    Lambda_Fy = random.normal(key3, (N,)) * 0.1
-    
-    # 初期温度
-    temperatures = 293.0 + 5.0 * (1 - y_positions / config.domain_height)
-    
-    # 更新
-    new_positions = jnp.where(
-        inject_mask[:, None],
-        jnp.stack([x_positions, y_positions], axis=1),
-        state.position
-    )
-    
-    new_Lambda_F = jnp.where(
-        inject_mask[:, None],
-        jnp.stack([Lambda_Fx, Lambda_Fy], axis=1),
-        state.Lambda_F
-    )
-    
-    return ParticleState(
-        position=new_positions,
-        Lambda_F=new_Lambda_F,
-        Lambda_FF=jnp.where(inject_mask[:, None], jnp.zeros((N, 2)), state.Lambda_FF),
-        prev_Lambda_F=new_Lambda_F,
-        Lambda_core=jnp.where(inject_mask[:, None], jnp.zeros((N, 4)), state.Lambda_core),
-        rho_T=jnp.where(inject_mask, jnp.linalg.norm(new_Lambda_F, axis=1), state.rho_T),
-        sigma_s=jnp.where(inject_mask, 0.0, state.sigma_s),
-        prev_sigma_s=jnp.where(inject_mask, 0.0, state.prev_sigma_s),
-        Q_Lambda=jnp.where(inject_mask, 0.0, state.Q_Lambda),
-        prev_Q_Lambda=jnp.where(inject_mask, 0.0, state.prev_Q_Lambda),
-        efficiency=jnp.where(inject_mask, 0.5, state.efficiency),
-        emergence=jnp.where(inject_mask, 0.0, state.emergence),
-        temperature=jnp.where(inject_mask, temperatures, state.temperature),
-        density=jnp.where(inject_mask, 1.225, state.density),
-        vorticity=jnp.where(inject_mask, 0.0, state.vorticity),
-        Q_criterion=jnp.where(inject_mask, 0.0, state.Q_criterion),
-        DeltaLambdaC=jnp.where(inject_mask, False, state.DeltaLambdaC),
-        event_score=jnp.where(inject_mask, 0.0, state.event_score),
-        age=jnp.where(inject_mask, 0.0, state.age),
-        is_active=inject_mask | state.is_active,
-        is_separated=jnp.where(inject_mask, False, state.is_separated),
-        near_wall=jnp.where(inject_mask, False, state.near_wall)
-    )
-
-# ==============================
-# メインシミュレーション（履歴保存を間引き）
-# ==============================
-
-def run_simulation_v63(map_file: str, config: GETWindConfig, 
-                      seed: int = 42, save_states: bool = True,
-                      snapshot_interval: int = 50):
-    """GET Wind™ v6.3 メインシミュレーション（幾何MAP駆動・修正版）"""
-    
-    # 幾何マップ読み込み
-    map_data = GeometricMapData(map_file)
-    
-    # 乱数キー
-    key = random.PRNGKey(seed)
-    
-    # 初期状態
-    N = config.max_particles
-    initial_state = ParticleState(
-        position=jnp.zeros((N, 2)),
-        Lambda_F=jnp.zeros((N, 2)),
-        Lambda_FF=jnp.zeros((N, 2)),
-        prev_Lambda_F=jnp.zeros((N, 2)),
-        Lambda_core=jnp.zeros((N, 4)),
-        rho_T=jnp.zeros(N),
-        sigma_s=jnp.zeros(N),
-        prev_sigma_s=jnp.zeros(N),
-        Q_Lambda=jnp.zeros(N),
-        prev_Q_Lambda=jnp.zeros(N),
-        efficiency=jnp.ones(N) * 0.5,
-        emergence=jnp.zeros(N),
-        temperature=jnp.ones(N) * 293.0,
-        density=jnp.ones(N) * 1.225,
-        vorticity=jnp.zeros(N),
-        Q_criterion=jnp.zeros(N),
-        DeltaLambdaC=jnp.zeros(N, dtype=bool),
-        event_score=jnp.zeros(N),
-        age=jnp.zeros(N),
-        is_active=jnp.zeros(N, dtype=bool),
-        is_separated=jnp.zeros(N, dtype=bool),
-        near_wall=jnp.zeros(N, dtype=bool)
-    )
-    
-    print("=" * 70)
-    print("GET Wind™ v6.3 - Geometric Bernoulli Integration [FIXED EDITION]")
-    print("環ちゃん & ご主人さま Ultimate Geometry Edition! 💕")
-    print(f"Map: {map_file}")
-    print(f"Max particles: {N}")
-    print(f"Steps: {config.n_steps}")
-    print(f"Snapshot interval: {snapshot_interval}")
-    print("Features: Fixed coordinate transforms, optimized branches, proper gradients")
-    print("=" * 70)
-    
-    # JITコンパイル
-    print("Compiling JIT functions...")
-    start_compile = time.time()
-    
-    key, subkey = random.split(key)
-    dummy_state = inject_particles(initial_state, config, subkey, 0)
-    key, subkey = random.split(key)
-    _ = physics_step_v63(
-        dummy_state,
-        map_data.pressure,
-        map_data.density,
-        map_data.separation,
-        map_data.vortex_formation,
-        map_data.wake_structure,
-        map_data.shear_layer,
-        map_data.nx,
-        map_data.ny,
-        config,
-        subkey
-    )
-    
-    print(f"JIT compilation done in {time.time() - start_compile:.2f}s")
-    
-    # メインループ
-    state = initial_state
-    history = []
-    state_history = []
-    
-    print("\nStarting simulation...")
-    start_time = time.time()
-    
-    for step in range(config.n_steps):
-        # 粒子注入
-        key, subkey = random.split(key)
-        state = inject_particles(state, config, subkey, step)
-        
-        # 物理ステップ
-        key, subkey = random.split(key)
-        state = physics_step_v63(
-            state,
-            map_data.pressure,
-            map_data.density,
-            map_data.separation,
-            map_data.vortex_formation,
-            map_data.wake_structure,
-            map_data.shear_layer,
-            map_data.nx,
-            map_data.ny,
-            config,
-            subkey
-        )
-        
-        # 状態保存（間引き）
-        if save_states:
-            state_history.append({
-                'step': step,
-                'position': np.array(state.position),
-                'Lambda_F': np.array(state.Lambda_F),
-                'vorticity': np.array(state.vorticity),
-                'Q_criterion': np.array(state.Q_criterion),
-                'is_active': np.array(state.is_active),
-                'is_separated': np.array(state.is_separated)
-            })
-        
-        # 定期的な統計出力
-        if step % 100 == 0 or step == config.n_steps - 1:
-            active_count = jnp.sum(state.is_active)
+def detect_vortices_dbscan(
+    positions: np.ndarray,
+    Lambda_F: np.ndarray,
+    Q_criterion: np.ndarray,
+    active_mask: np.ndarray,
+    eps: Optional[float] = None,
+    min_samples: int = 5,
+    Q_threshold: float = 0.15,
+    auto_eps: bool = True
+) -> List[Vortex]:
+    """DBSCANで渦を検出（自動eps対応）"""
+    
+    q_mask = active_mask & (Q_criterion > Q_threshold)
+    vortex_positions = positions[q_mask]
+    vortex_Lambda_F = Lambda_F[q_mask]
+    
+    if len(vortex_positions) < min_samples:
+        return []
+    
+    # 自動eps計算
+    if auto_eps and eps is None:
+        nbrs = NearestNeighbors(n_neighbors=min(5, len(vortex_positions))).fit(vortex_positions)
+        dists, _ = nbrs.kneighbors(vortex_positions)
+        if dists.shape[1] > 1:
+            eps = np.median(dists[:, 1]) * 3.0  # 第2近傍の中央値×3
+        else:
+            eps = 25.0  # フォールバック
+    elif eps is None:
+        eps = 25.0
+    
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(vortex_positions)
+    labels = clustering.labels_
+    
+    vortices = []
+    for cluster_id in set(labels):
+        if cluster_id == -1:
+            continue
             
-            if active_count > 0:
-                active_mask = state.is_active
-                
-                mean_Lambda_F = jnp.mean(jnp.linalg.norm(state.Lambda_F[active_mask], axis=1))
-                mean_vorticity = jnp.mean(jnp.abs(state.vorticity[active_mask]))
-                max_vorticity = jnp.max(jnp.abs(state.vorticity[active_mask]))
-                mean_emergence = jnp.mean(state.emergence[active_mask])
-                n_separated = jnp.sum(state.is_separated & active_mask)
-                
-                print(f"\nStep {step:4d}: {int(active_count):4d} particles")
-                print(f"  |ΛF|={mean_Lambda_F:.2f}, |ω|={mean_vorticity:.3f} (max={max_vorticity:.3f})")
-                print(f"  Emergence={mean_emergence:.3f}, Separated={int(n_separated)}")
-                
-                history.append({
-                    'step': step,
-                    'n_particles': int(active_count),
-                    'mean_Lambda_F': float(mean_Lambda_F),
-                    'mean_vorticity': float(mean_vorticity),
-                    'max_vorticity': float(max_vorticity),
-                    'mean_emergence': float(mean_emergence),
-                    'n_separated': int(n_separated)
-                })
+        cluster_mask = labels == cluster_id
+        cluster_positions = vortex_positions[cluster_mask]
+        cluster_Lambda_F = vortex_Lambda_F[cluster_mask]
+        
+        center = np.mean(cluster_positions, axis=0)
+        
+        circulation = compute_circulation(
+            cluster_Lambda_F,
+            cluster_positions,
+            center
+        )
+        
+        vortices.append(Vortex(
+            center=center,
+            n_particles=len(cluster_positions),
+            circulation=circulation,
+            cluster_id=cluster_id
+        ))
     
-    elapsed = time.time() - start_time
+    return vortices
+
+def compute_circulation(
+    Lambda_F: np.ndarray,
+    positions: np.ndarray,
+    center: np.ndarray
+) -> float:
+    """循環を計算"""
     
-    print("\n" + "=" * 70)
-    print("SIMULATION COMPLETE!")
-    print(f"Total time: {elapsed:.2f}s")
-    print(f"Performance: {config.n_steps / elapsed:.1f} steps/sec")
-    print(f"Saved {len(state_history)} snapshots")
-    print("=" * 70)
+    rel_pos = positions - center
+    distances = np.linalg.norm(rel_pos, axis=1) + 1e-8
     
-    # 結果保存
-    if save_states:
-        shape_name = "cylinder" if config.obstacle_shape == 0 else "square"
-        filename = f"simulation_results_v63_{shape_name}.npz"
-        np.savez_compressed(filename,
-                           states=state_history,
-                           history=history,
-                           config=config._asdict())
-        print(f"\nResults saved to {filename} (compressed)")
+    tangent = np.stack([-rel_pos[:, 1], rel_pos[:, 0]], axis=1)
+    tangent = tangent / distances[:, None]
     
-    return state, history
+    v_tangential = np.sum(Lambda_F * tangent, axis=1)
+    weights = np.exp(-distances / 10.0)
+    
+    circulation = np.sum(v_tangential * weights) / np.sum(weights)
+    
+    return circulation
 
 # ==============================
-# メイン実行
+# 改良版トラッカー（シンプル）
+# ==============================
+
+class SimpleVortexTracker:
+    """シンプルで安定したトラッカー"""
+    
+    def __init__(self, matching_threshold: float = 40.0):
+        self.matching_threshold = matching_threshold
+        self.next_id = 0
+        self.tracks = {}
+        
+    def update(self, vortices: List[Vortex], step: int) -> Dict[int, int]:
+        """渦の更新"""
+        
+        if not vortices:
+            return {}
+        
+        current_positions = np.array([v.center for v in vortices])
+        new_tracks = {}
+        used_vortices = set()
+        
+        # 既存トラックの延長
+        for track_id, track in self.tracks.items():
+            if len(track) == 0:
+                continue
+                
+            last_step, last_pos, last_circ = track[-1]
+            
+            # 予測位置（単純に下流へ）
+            predicted_pos = last_pos + np.array([10.0 * (step - last_step) * 0.02, 0])
+            
+            min_dist = float('inf')
+            best_match = None
+            
+            for i, pos in enumerate(current_positions):
+                if i in used_vortices:
+                    continue
+                
+                # x座標が大きく逆流していないか
+                if pos[0] < last_pos[0] - 20:
+                    continue
+                
+                dist = np.linalg.norm(pos - predicted_pos)
+                if dist < self.matching_threshold and dist < min_dist:
+                    min_dist = dist
+                    best_match = i
+            
+            if best_match is not None:
+                new_tracks[track_id] = track + [(
+                    step,
+                    current_positions[best_match],
+                    vortices[best_match].circulation
+                )]
+                used_vortices.add(best_match)
+        
+        # 新規渦の追加（障害物近傍のみ）
+        for i, vortex in enumerate(vortices):
+            if i not in used_vortices:
+                # 障害物後方の適切な範囲でのみ新規生成
+                if 80 < vortex.center[0] < 160:
+                    if abs(vortex.circulation) > 1.0 and vortex.n_particles > 8:
+                        track_id = self.next_id
+                        self.next_id += 1
+                        new_tracks[track_id] = [(
+                            step,
+                            vortex.center,
+                            vortex.circulation
+                        )]
+        
+        # 古いトラックを削除
+        self.tracks = {tid: track for tid, track in new_tracks.items() 
+                      if len(track) > 0 and (step - track[-1][0]) < 100}
+        
+        return {i: tid for tid, i in enumerate(self.tracks.keys())}
+
+# ==============================
+# Ultimate版：揚力係数によるStrouhal数計算
+# ==============================
+
+def compute_effective_reynolds(states, config, n_samples=100):
+    """実効Reynolds数を推定"""
+    
+    # 障害物近傍での粘性係数をサンプリング
+    sample_indices = np.linspace(1000, len(states)-1, n_samples, dtype=int)
+    
+    viscosity_samples = []
+    for idx in sample_indices:
+        state = states[idx]
+        position = state['position']
+        is_active = state['is_active']
+        
+        # 障害物近傍の粒子
+        dx = position[:, 0] - config.obstacle_center_x
+        dy = position[:, 1] - config.obstacle_center_y
+        r = np.sqrt(dx**2 + dy**2)
+        near_obstacle = (r > config.obstacle_size) & (r < config.obstacle_size * 1.5) & is_active
+        
+        if np.sum(near_obstacle) > 0:
+            # 局所的な実効粘性（簡易推定）
+            effective_visc = config.viscosity_factor * 0.05
+            viscosity_samples.append(effective_visc)
+    
+    if viscosity_samples:
+        nu_eff = np.mean(viscosity_samples)
+        D = 2 * config.obstacle_size
+        Re_eff = config.Lambda_F_inlet * D / nu_eff
+        return Re_eff, nu_eff
+    else:
+        return 200.0, config.viscosity_factor * 0.05  # デフォルト
+
+def estimate_Ueff(states, config, x_probe=None, n_samples=64):
+    """実効流速U_effを推定（上流プローブ）"""
+    if x_probe is None:
+        x_probe = config.obstacle_center_x - 5.0 * (2*config.obstacle_size)
+    
+    # プローブ位置がドメイン内か確認
+    if x_probe < 10:
+        x_probe = 10
+    
+    vals = []
+    for st in states[1000:]:  # 過渡除外
+        pos = st['position'] if isinstance(st, dict) else st.position
+        vel = st['Lambda_F'] if isinstance(st, dict) else st.Lambda_F
+        act = st['is_active'] if isinstance(st, dict) else st.is_active
+        
+        # x_probe付近の薄帯での流速
+        mask = act & (np.abs(pos[:,0] - x_probe) < 1.0)
+        if np.any(mask):
+            vals.append(np.mean(vel[mask, 0]))  # x方向流速の平均
+    
+    return float(np.mean(vals)) if vals else config.Lambda_F_inlet
+
+def lift_coefficient_ring_binned(state, config, n_bins=64):
+    """等角ビンCL計算（粒子バイアス除去）"""
+    pos = state['position'] if isinstance(state, dict) else state.position
+    vel = state['Lambda_F'] if isinstance(state, dict) else state.Lambda_F
+    act = state['is_active'] if isinstance(state, dict) else state.is_active
+
+    dx = pos[:,0] - config.obstacle_center_x
+    dy = pos[:,1] - config.obstacle_center_y
+    r = np.sqrt(dx*dx + dy*dy)
+    theta = np.arctan2(dy, dx)
+
+    # より薄いリング（1.0-1.3倍）
+    ring = (r > config.obstacle_size*1.00) & (r < config.obstacle_size*1.30) & act
+    if np.sum(ring) < 32:
+        return 0.0
+
+    vel_mag = np.linalg.norm(vel[ring], axis=1)
+    Cp = 1.0 - (vel_mag / config.Lambda_F_inlet)**2
+
+    th = theta[ring]
+    bins = np.linspace(-np.pi, np.pi, n_bins+1)
+    idx = np.digitize(th, bins) - 1
+    
+    CL_up = []
+    CL_lo = []
+
+    for k in range(n_bins):
+        m = (idx == k)
+        if not np.any(m):
+            continue
+        
+        thk = th[m]
+        Cpk = Cp[m]
+        rep = np.median(Cpk)    # 代表値（中央値）
+        thm = np.median(thk)     # ビン中心角度
+        term = rep * np.sin(thm)
+        
+        if thm > 0:
+            CL_up.append(term)
+        else:
+            CL_lo.append(term)
+
+    up = np.mean(CL_up) if CL_up else 0.0
+    lo = np.mean(CL_lo) if CL_lo else 0.0
+    return (up - lo) * 2.0
+
+def compute_lift_coefficient_ultimate(state, config, method='binned'):
+    """Ultimate版：揚力係数（等角ビンor重み付き）"""
+    
+    if method == 'binned':
+        return lift_coefficient_ring_binned(state, config)
+    else:
+        # 従来の重み付き版（フォールバック）
+        # stateが辞書の場合の処理
+        if isinstance(state, dict):
+            position = state['position']
+            Lambda_F = state['Lambda_F']
+            is_active = state['is_active']
+        else:
+            position = state.position
+            Lambda_F = state.Lambda_F
+            is_active = state.is_active
+        
+        # 障害物表面近傍の粒子を選択
+        dx = position[:, 0] - config.obstacle_center_x
+        dy = position[:, 1] - config.obstacle_center_y
+        r = np.sqrt(dx**2 + dy**2)
+        
+        # 表面近傍（1.0-2.0倍の半径）
+        near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 2.0) & is_active
+        
+        if np.sum(near_surface) < 10:
+            return 0.0
+        
+        # 極座標での角度
+        theta = np.arctan2(dy[near_surface], dx[near_surface])
+        r_near = r[near_surface]
+        
+        # 速度の大きさから圧力係数を計算（ベルヌーイの定理）
+        velocity_mag = np.linalg.norm(Lambda_F[near_surface], axis=1)
+        Cp = 1.0 - (velocity_mag / config.Lambda_F_inlet)**2
+        
+        # 幾何重み（半径方向の線素）
+        w = r_near / np.mean(r_near)  # 正規化された半径重み
+        
+        # 上半分と下半分で別々に積分
+        upper_mask = theta > 0
+        lower_mask = theta <= 0
+        
+        # 各領域での重み付き圧力積分
+        if np.any(upper_mask):
+            upper_contribution = np.average(
+                Cp[upper_mask] * np.sin(theta[upper_mask]), 
+                weights=w[upper_mask]
+            )
+        else:
+            upper_contribution = 0.0
+            
+        if np.any(lower_mask):
+            lower_contribution = np.average(
+                Cp[lower_mask] * np.sin(theta[lower_mask]), 
+                weights=w[lower_mask]
+            )
+        else:
+            lower_contribution = 0.0
+        
+        # 揚力係数（上下の圧力差）
+        CL = (upper_contribution - lower_contribution) * 2.0
+        
+        return CL
+
+def refine_peak(freqs, power):
+    """ピークの放物線補間"""
+    k = np.argmax(power)
+    if 0 < k < len(power)-1:
+        y1, y2, y3 = power[k-1], power[k], power[k+1]
+        denom = (y1 - 2*y2 + y3)
+        if denom != 0:
+            delta = 0.5*(y1 - y3)/denom
+            return k + np.clip(delta, -0.5, 0.5)
+    return float(k)
+
+def estimate_f0_autocorr(sig, dt):
+    """自己相関によるピーク周波数初期推定"""
+    sig = sig - np.mean(sig)
+    ac = np.correlate(sig, sig, mode='full')[len(sig)-1:]
+    ac = ac / np.max(ac)
+    
+    # 最初の谷の後の最初の山を探す
+    from scipy.signal import find_peaks
+    peaks, _ = find_peaks(ac, distance=int(0.1/dt))
+    
+    if len(peaks) > 1:
+        T = peaks[1] * dt
+        return 1.0/T
+    return None
+
+def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
+    """Ultimate版：高速・高精度Strouhal数計算"""
+    
+    print("\n📊 Computing lift coefficient time series...")
+    
+    # CLの時系列を計算（等角ビン版）
+    CL_history = []
+    for i, state in enumerate(states):
+        if i % 500 == 0:
+            print(f"  Processing step {i}/{len(states)}")
+        CL = compute_lift_coefficient_ultimate(state, config, method='binned')
+        CL_history.append(CL)
+    
+    # 初期の過渡応答を除去
+    CL_signal = np.array(CL_history[1000:])  # 最初の1000ステップを除外
+    
+    if len(CL_signal) < 500:
+        print("Warning: Not enough data for accurate FFT")
+        return 0.0
+    
+    # 時間軸（物理単位）
+    time = np.arange(len(CL_signal)) * config.dt
+    
+    # トレンド除去
+    CL_signal = CL_signal - np.mean(CL_signal)
+    
+    # === U_effの推定 ===
+    print("\n  Estimating effective velocity U_eff...")
+    U_eff = estimate_Ueff(states, config)
+    print(f"  U_eff = {U_eff:.3f} (inlet = {config.Lambda_F_inlet})")
+    
+    # === 自己相関による初期推定 ===
+    f0 = estimate_f0_autocorr(CL_signal, config.dt)
+    if f0 is None:
+        # ラフな初期推定
+        D = 2 * config.obstacle_size
+        f0 = 0.2 * U_eff / D  # St≈0.2の仮定
+    print(f"  Initial frequency estimate: {f0:.4f} Hz")
+    
+    if method == 'rfft':
+        # === rFFT法（高速） ===
+        window = np.hanning(len(CL_signal))
+        CL_windowed = CL_signal * window
+        
+        # ゼロパディング（FFT精度向上）
+        n_padded = 2**int(np.ceil(np.log2(len(CL_windowed) * 4)))
+        
+        # 実数FFT
+        fft = np.fft.rfft(CL_windowed, n=n_padded)
+        freqs = np.fft.rfftfreq(n_padded, d=config.dt)
+        power = np.abs(fft)**2
+        
+    elif method == 'welch':
+        # === Welch法（ノイズに強い） ===
+        nperseg = min(4096, len(CL_signal))
+        freqs, power = welch(CL_signal, 
+                           fs=1.0/config.dt, 
+                           window='hann',
+                           nperseg=nperseg,
+                           noverlap=nperseg//2)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # === 狭窓でのピーク探索 ===
+    fmin, fmax = 0.7*f0, 1.3*f0
+    valid_range = (freqs > fmin) & (freqs < fmax)
+    
+    if np.any(valid_range):
+        valid_freqs = freqs[valid_range]
+        valid_power = power[valid_range]
+        
+        # 放物線補間でサブビン精度
+        kref = refine_peak(valid_freqs, valid_power)
+        peak_freq = np.interp(kref, np.arange(len(valid_freqs)), valid_freqs)
+        
+        # カルマン渦の周波数補正
+        # CL（揚力）はshedding周波数f_sで振動 → 補正は不要
+        frequency_correction = 1.0
+        
+        # Strouhal数を計算（U_eff使用！）
+        D = 2 * config.obstacle_size
+        St_raw = peak_freq * D / U_eff  # ←ここが重要！
+        St_corrected = St_raw * frequency_correction
+        
+        # 実効Reynolds数の推定
+        Re_eff, nu_eff = compute_effective_reynolds(states, config)
+        
+        if debug:
+            print(f"\n✨ Ultimate Lift Coefficient Analysis:")
+            print(f"  Peak frequency: {peak_freq:.4f} Hz (refined)")
+            print(f"  U_eff: {U_eff:.3f} (vs inlet: {config.Lambda_F_inlet})")
+            print(f"  Raw Strouhal: {St_raw:.4f}")
+            print(f"  Corrected Strouhal: {St_corrected:.4f}")
+            print(f"  Effective Reynolds: {Re_eff:.1f}")
+            print(f"  Target St (Re=200): 0.195")
+            print(f"  Error: {abs(St_corrected - 0.195)/0.195*100:.1f}%")
+            
+            # ブロッケージ比の確認
+            blockage = D / 150.0  # 直径/ドメイン高さ
+            print(f"  Blockage ratio: {blockage:.3f}")
+            if blockage > 0.2:
+                print(f"  ⚠ High blockage may affect St by ~{(blockage-0.2)*10:.1f}%")
+            
+            # 詳細なプロット
+            fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+            
+            # 1. 元の時系列（時間軸）
+            ax = axes[0, 0]
+            time_full = np.arange(len(CL_history)) * config.dt
+            ax.plot(time_full, CL_history, linewidth=0.5)
+            ax.set_xlabel('Time [s]')
+            ax.set_ylabel('CL')
+            ax.set_title('Raw Lift Coefficient Time Series')
+            ax.grid(True, alpha=0.3)
+            
+            # 2. 処理後の信号
+            ax = axes[0, 1]
+            ax.plot(time, CL_signal, linewidth=0.5)
+            ax.set_xlabel('Time [s]')
+            ax.set_ylabel('CL (detrended)')
+            ax.set_title('Processed Signal (after removing initial transient)')
+            ax.grid(True, alpha=0.3)
+            
+            # 3. パワースペクトル（線形スケール）
+            ax = axes[0, 2]
+            mask = freqs < 0.5
+            ax.plot(freqs[mask], power[mask])
+            ax.axvline(peak_freq, color='red', linestyle='--', 
+                      label=f'Peak: {peak_freq:.4f} Hz')
+            ax.axvspan(fmin, fmax, alpha=0.2, color='yellow', label='Search window')
+            ax.set_xlabel('Frequency [Hz]')
+            ax.set_ylabel('Power')
+            ax.set_title(f'Power Spectrum ({method.upper()})')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # 4. パワースペクトル（対数スケール）
+            ax = axes[1, 0]
+            ax.semilogy(freqs[mask], power[mask])
+            ax.axvline(peak_freq, color='red', linestyle='--', 
+                      label=f'Peak: {peak_freq:.4f} Hz')
+            expected_f = 0.195 * U_eff / D
+            ax.axvline(expected_f, color='green', linestyle=':', 
+                      label=f'Expected (St=0.195): {expected_f:.4f} Hz')
+            ax.set_xlabel('Frequency [Hz]')
+            ax.set_ylabel('Power (log scale)')
+            ax.set_title('Power Spectrum (Log Scale)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # 5. Strouhal vs Reynolds
+            ax = axes[1, 1]
+            Re_range = np.array([100, 150, 200, 250, 300])
+            St_empirical = 0.195 * np.ones_like(Re_range)  # Re=200付近では一定
+            ax.plot(Re_range, St_empirical, 'g-', label='Empirical')
+            ax.scatter([Re_eff], [St_corrected], color='red', s=100, 
+                      zorder=5, label=f'Simulation (Re={Re_eff:.0f})')
+            ax.set_xlabel('Reynolds Number')
+            ax.set_ylabel('Strouhal Number')
+            ax.set_title('St vs Re Comparison')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # 6. FFT解像度とU_eff情報
+            ax = axes[1, 2]
+            df = freqs[1] - freqs[0] if len(freqs) > 1 else 0
+            resolution_info = f"Frequency resolution: {df:.5f} Hz\n"
+            resolution_info += f"Nyquist frequency: {0.5/config.dt:.2f} Hz\n"
+            resolution_info += f"Signal length: {len(CL_signal)} samples\n"
+            resolution_info += f"Time span: {len(CL_signal)*config.dt:.1f} s\n"
+            resolution_info += f"Method: {method.upper()}\n"
+            resolution_info += f"─────────────────\n"
+            resolution_info += f"U_eff: {U_eff:.3f} m/s\n"
+            resolution_info += f"U_inlet: {config.Lambda_F_inlet:.1f} m/s\n"
+            resolution_info += f"Reduction: {(1-U_eff/config.Lambda_F_inlet)*100:.1f}%"
+            ax.text(0.1, 0.5, resolution_info, transform=ax.transAxes,
+                   fontsize=11, verticalalignment='center',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax.axis('off')
+            ax.set_title('Analysis Parameters')
+            
+            plt.tight_layout()
+            plt.savefig('lift_analysis_ultimate.png', dpi=150)
+            print(f"  Plot saved to 'lift_analysis_ultimate.png'")
+        
+        return St_corrected
+    else:
+        print(f"Warning: No valid peak found in range [{fmin:.4f}, {fmax:.4f}] Hz")
+        return 0.0
+
+# ==============================
+# きれいな軌跡描画
+# ==============================
+
+def plot_clean_vortex_trajectories(tracker, figsize=(14, 7)):
+    """きれいなカルマン渦の軌跡を描画"""
+    
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # 有効な軌跡をフィルタリング
+    valid_tracks = []
+    for track_id, track in tracker.tracks.items():
+        if len(track) < 10:  # 10ステップ以上続いた渦のみ
+            continue
+            
+        positions = np.array([t[1] for t in track])
+        circulations = np.array([t[2] for t in track])
+        
+        # x座標が単調増加しているかチェック
+        x_coords = positions[:, 0]
+        for i in range(1, len(x_coords)):
+            if x_coords[i] < x_coords[i-1] - 15:  # 15単位以上の逆流は異常
+                positions = positions[:i]  # 逆流前までで切る
+                break
+        
+        if len(positions) < 20:
+            continue
+            
+        # 総移動距離チェック
+        total_dist = np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1))
+        if total_dist < 20 or total_dist > 800:
+            continue
+            
+        # 平均循環強度
+        mean_circ = np.mean(np.abs(circulations))
+        if mean_circ < 0.3:
+            continue
+            
+        valid_tracks.append((track_id, positions, mean_circ))
+    
+    # 軌跡を描画
+    for idx, (track_id, positions, mean_circ) in enumerate(valid_tracks):
+        # スムージング（オプション）
+        if len(positions) > 5:
+            positions[:, 0] = gaussian_filter1d(positions[:, 0], sigma=1.5)
+            positions[:, 1] = gaussian_filter1d(positions[:, 1], sigma=1.5)
+        
+        # 色分け（初期y位置で判定）
+        if positions[0, 1] > 75:
+            color = 'red'
+            label = 'Upper vortex' if idx == 0 else None
+        else:
+            color = 'blue'
+            label = 'Lower vortex' if idx == 1 else None
+        
+        # 軌跡を描画
+        ax.plot(positions[:, 0], positions[:, 1],
+                color=color, alpha=0.6, linewidth=2,
+                label=label)
+        
+        # 始点と終点をマーク
+        ax.scatter(positions[0, 0], positions[0, 1], 
+                  color=color, s=50, marker='o', zorder=5)
+        ax.scatter(positions[-1, 0], positions[-1, 1], 
+                  color=color, s=50, marker='s', zorder=5)
+    
+    # 理想的なカルマン渦の軌跡（参考）
+    t = np.linspace(0, 150, 100)
+    x_ideal = 100 + t
+    y_upper_ideal = 75 + 25 * np.sin(2 * np.pi * t / 50) * np.exp(-t / 200)
+    y_lower_ideal = 75 - 25 * np.sin(2 * np.pi * t / 50 + np.pi) * np.exp(-t / 200)
+    
+    ax.plot(x_ideal, y_upper_ideal, 'r--', alpha=0.2, linewidth=1, label='Ideal upper')
+    ax.plot(x_ideal, y_lower_ideal, 'b--', alpha=0.2, linewidth=1, label='Ideal lower')
+    
+    # 障害物
+    circle = plt.Circle((100, 75), 20, fill=False, color='black', linewidth=2)
+    ax.add_patch(circle)
+    ax.add_patch(plt.Circle((100, 75), 20, fill=True, color='gray', alpha=0.3))
+    
+    # グリッドとラベル
+    ax.set_xlim(0, 300)
+    ax.set_ylim(0, 150)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X position')
+    ax.set_ylabel('Y position')
+    ax.set_title('Clean Vortex Trajectories (Karman Vortex Street)')
+    ax.legend(loc='upper right')
+    
+    # 流れ方向の矢印
+    ax.arrow(10, 140, 30, 0, head_width=3, head_length=5, 
+            fc='gray', ec='gray', alpha=0.5)
+    ax.text(25, 145, 'Flow', ha='center', fontsize=10, color='gray')
+    
+    plt.tight_layout()
+    return fig
+
+# ==============================
+# メイン処理（Ultimate版）
+# ==============================
+
+def process_simulation_results(
+    simulation_file: str = 'simulation_results_v63_cylinder.npz',  # v6.3対応！
+    debug: bool = True,
+    fft_method: str = 'rfft'  # 'rfft' or 'welch'
+):
+    """シミュレーション結果を処理してStrouhal数を計算"""
+    
+    print("=" * 70)
+    print("GET Wind™ Vortex Analysis - Ultimate Edition")
+    print("環ちゃん & ご主人さま Complete Fix! 💕")
+    print("=" * 70)
+    
+    # データ読み込み
+    print("\n📁 Loading simulation data...")
+    print(f"  File: {simulation_file}")
+    
+    try:
+        data = np.load(simulation_file, allow_pickle=True)
+    except FileNotFoundError:
+        print(f"  ⚠ File not found: {simulation_file}")
+        # フォールバック試行
+        fallback_files = [
+            'simulation_results_v63.npz',
+            'simulation_results_v62.npz'
+        ]
+        for fallback in fallback_files:
+            try:
+                print(f"  Trying fallback: {fallback}")
+                data = np.load(fallback, allow_pickle=True)
+                simulation_file = fallback
+                break
+            except FileNotFoundError:
+                continue
+        else:
+            raise FileNotFoundError(f"No simulation result file found!")
+    
+    states = data['states'].tolist() if hasattr(data['states'], 'tolist') else data['states']
+    config_dict = data['config'].item() if hasattr(data['config'], 'item') else data['config']
+    
+    # 簡易Config作成
+    class SimpleConfig:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    
+    if isinstance(config_dict, dict):
+        config = SimpleConfig(**config_dict)
+    else:
+        config = config_dict
+    
+    print(f"  Loaded {len(states)} timesteps")
+    print(f"  dt = {config.dt}")
+    print(f"  Obstacle: center=({config.obstacle_center_x}, {config.obstacle_center_y}), radius={config.obstacle_size}")
+    print(f"  Inlet velocity: {config.Lambda_F_inlet}")
+    
+    # Reynolds数の確認
+    D = 2 * config.obstacle_size
+    Re_nominal = config.Lambda_F_inlet * D / (config.viscosity_factor * 0.05)
+    print(f"  Nominal Reynolds number: {Re_nominal:.1f}")
+    
+    # 揚力係数法でStrouhal数計算（Ultimate版）
+    St_lift = compute_strouhal_ultimate(states, config, debug=debug, method=fft_method)
+    
+    # DBSCANトラッキング（可視化用、自動eps）
+    if debug:
+        print("\n🔍 Processing vortex tracking for visualization...")
+        tracker = SimpleVortexTracker(matching_threshold=40.0)
+        
+        for i, state in enumerate(states):
+            if i % 500 == 0:
+                print(f"  Step {i}/{len(states)}")
+            
+            # stateが辞書の場合の処理
+            if isinstance(state, dict):
+                positions = state['position']
+                Lambda_F = state['Lambda_F']
+                Q_criterion = state['Q_criterion']
+                is_active = state['is_active']
+            else:
+                positions = state.position
+                Lambda_F = state.Lambda_F
+                Q_criterion = state.Q_criterion
+                is_active = state.is_active
+            
+            vortices = detect_vortices_dbscan(
+                positions,
+                Lambda_F,
+                Q_criterion,
+                is_active,
+                eps=None,  # 自動計算
+                min_samples=8,
+                Q_threshold=0.2,
+                auto_eps=True
+            )
+            
+            # 強い渦のみ
+            strong_vortices = [v for v in vortices 
+                              if abs(v.circulation) > 1.0 and v.n_particles > 10]
+            
+            tracker.update(strong_vortices, i)
+        
+        # きれいな軌跡を描画
+        print("\n📈 Plotting clean trajectories...")
+        fig = plot_clean_vortex_trajectories(tracker)
+        plt.savefig('clean_vortex_trajectories_ultimate.png', dpi=150)
+        print("  Saved to 'clean_vortex_trajectories_ultimate.png'")
+    
+    # 最終結果
+    print("\n" + "=" * 70)
+    print("✨ FINAL RESULTS (Ultimate Analysis):")
+    print(f"  Strouhal number: {St_lift:.4f}")
+    print(f"  Target (Re=200): 0.195")
+    print(f"  Error: {abs(St_lift - 0.195)/0.195*100:.1f}%")
+    print(f"  FFT Method: {fft_method.upper()}")
+    
+    if 0.18 < St_lift < 0.21:
+        print("  🎉 SUCCESS! Strouhal number is within 10% of target!")
+    elif 0.15 < St_lift < 0.25:
+        print("  ✅ Good! Strouhal number is physically reasonable.")
+    else:
+        print("  ⚠️  Strouhal number needs further tuning.")
+    
+    print("=" * 70)
+    
+    return St_lift
+
+# ==============================
+# 実行
 # ==============================
 
 if __name__ == "__main__":
-    # 設定
-    config = GETWindConfig(
-        obstacle_shape=0,  # 0=cylinder, 1=square
-        particles_per_step=5.0,
-        max_particles=1500,
-        n_steps=5000,
-        dt=0.02,
-        
-        # 流れパラメータ
-        Lambda_F_inlet=10.0,
-        
-        # Λ³パラメータ（調整済み）
-        thermal_alpha=0.01,
-        density_beta=0.02,
-        structure_coupling=0.03,
-        viscosity_factor=0.1,
-        interaction_strength=0.1,
-        
-        # 幾何MAP用パラメータ
-        shear_instability_strength=0.8,
-        vortex_formation_noise=1.2,
-        wake_turbulence_factor=1.0,
-        
-        # 障害物設定
-        obstacle_center_x=100.0,
-        obstacle_center_y=75.0,
-        obstacle_size=20.0
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='GET Wind™ Ultimate Vortex Analysis')
+    parser.add_argument('--file', type=str, 
+                       default='simulation_results_v63_cylinder.npz',
+                       help='Simulation result file')
+    parser.add_argument('--method', type=str, 
+                       choices=['rfft', 'welch'],
+                       default='rfft',
+                       help='FFT method for spectrum analysis')
+    parser.add_argument('--no-debug', action='store_true',
+                       help='Disable debug plots')
+    
+    args = parser.parse_args()
+    
+    # メイン処理を実行
+    St = process_simulation_results(
+        simulation_file=args.file,
+        debug=not args.no_debug,
+        fft_method=args.method
     )
     
-    # マップファイル（幾何MAP）
-    shape_name = "cylinder" if config.obstacle_shape == 0 else "square"
-    map_file = f"{shape_name}_Re200_geometric.npz"
-    
-    print("\n" + "=" * 70)
-    print("GET Wind™ v6.3 Fixed - Geometric Bernoulli Edition 🌀")
-    print("With 環's complete patch applied!")
-    print("=" * 70)
-    
-    try:
-        final_state, history = run_simulation_v63(map_file, config, 
-                                                  save_states=True, 
-                                                  snapshot_interval=50)
-        print("\n✨ v6.3 Fixed Complete! Physics emerges from geometry! ✨")
-        
-    except FileNotFoundError:
-        print(f"\n⚠ Map file '{map_file}' not found!")
-        print("Please run the Geometric Bernoulli Map Generator first.")
+    print(f"\n🌀 Final Strouhal number: {St:.4f}")
+    print("✨ Ultimate Analysis complete! 💕")
