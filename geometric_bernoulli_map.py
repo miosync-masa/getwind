@@ -50,6 +50,16 @@ class GridConfig:
     scale_s_per_step: float = 0.01   # 1ステップ = 0.01秒
     
     @property
+    def dx(self) -> float:
+        """グリッド間隔 x方向 [unit]"""
+        return (self.x_max - self.x_min) / (self.nx - 1)
+    
+    @property
+    def dy(self) -> float:
+        """グリッド間隔 y方向 [unit]"""
+        return (self.y_max - self.y_min) / (self.ny - 1)
+    
+    @property
     def physical_width(self) -> float:
         """物理的な幅 [m]"""
         return (self.x_max - self.x_min) * self.scale_m_per_unit
@@ -58,13 +68,23 @@ class GridConfig:
     def physical_height(self) -> float:
         """物理的な高さ [m]"""
         return (self.y_max - self.y_min) * self.scale_m_per_unit
+    
+    @property
+    def physical_dx(self) -> float:
+        """物理的なグリッド間隔 x方向 [m]"""
+        return self.dx * self.scale_m_per_unit
+    
+    @property
+    def physical_dy(self) -> float:
+        """物理的なグリッド間隔 y方向 [m]"""
+        return self.dy * self.scale_m_per_unit
 
 # ==============================
 # Geometric Bernoulli Field Calculator
 # ==============================
 
 class GeometricBernoulliCalculator:
-    """幾何学的ベルヌーイ場の計算"""
+    """幾何学的ベルヌーイ場の計算（dx/dy修正版）"""
     
     def __init__(self, obstacle: ObstacleConfig, flow: FlowConfig, grid: GridConfig):
         self.obstacle = obstacle
@@ -76,8 +96,41 @@ class GeometricBernoulliCalculator:
         self.y = np.linspace(grid.y_min, grid.y_max, grid.ny)
         self.X, self.Y = np.meshgrid(self.x, self.y, indexing='ij')
         
+        # ✨ dx, dyを計算して保存！
+        self.dx = (grid.x_max - grid.x_min) / (grid.nx - 1)
+        self.dy = (grid.y_max - grid.y_min) / (grid.ny - 1)
+        
         # 形状別の物理パラメータ（Re=200での実験値）
         self.physics_params = self._get_physics_params()
+    
+    def _compute_streamline_curvature(self, psi: np.ndarray) -> np.ndarray:
+        """流線の曲率を計算（dx/dy修正版）"""
+        # 流線関数の勾配（self.dxとself.dyを使用）
+        dpsi_dx = np.gradient(psi, self.dx, axis=0)
+        dpsi_dy = np.gradient(psi, self.dy, axis=1)
+        
+        # 二階微分
+        d2psi_dx2 = np.gradient(dpsi_dx, self.dx, axis=0)
+        d2psi_dy2 = np.gradient(dpsi_dy, self.dy, axis=1)
+        
+        # 曲率の近似
+        grad_norm = np.sqrt(dpsi_dx**2 + dpsi_dy**2) + 1e-8
+        curvature = np.abs(d2psi_dx2 + d2psi_dy2) / grad_norm
+        
+        # スムージング
+        from scipy.ndimage import gaussian_filter
+        curvature = gaussian_filter(curvature, sigma=2.0)
+        
+        return np.clip(curvature, 0, 10.0)
+    
+    def _velocity_to_stream_function(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """速度場から流線関数を計算（dx/dy修正版）"""
+        psi = np.zeros_like(u)
+        # 簡易的な積分（下端から）（self.dyを使用）
+        for i in range(self.grid.nx):
+            for j in range(1, self.grid.ny):
+                psi[i, j] = psi[i, j-1] + u[i, j-1] * self.dy
+        return psi
         
     def _get_physics_params(self) -> Dict:
         """形状別の物理パラメータ（実験値ベース）"""
