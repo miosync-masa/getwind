@@ -236,26 +236,43 @@ def compute_effective_reynolds(states, config, n_samples=100):
         return 200.0, config.viscosity_factor * 0.05  # デフォルト
 
 def estimate_Ueff(states, config, x_probe=None, n_samples=64):
-    """実効流速U_effを推定（上流プローブ）"""
+    """実効流速U_effを推定（上流プローブ）- 修正版"""
     if x_probe is None:
-        x_probe = config.obstacle_center_x - 5.0 * (2*config.obstacle_size)
+        # 障害物の3D上流（5Dは遠すぎるかも）
+        x_probe = config.obstacle_center_x - 3.0 * config.obstacle_size
     
     # プローブ位置がドメイン内か確認
-    if x_probe < 10:
-        x_probe = 10
+    x_probe = max(20.0, x_probe)
     
     vals = []
-    for st in states[1000:]:  # 過渡除外
+    # サンプリングを適度に制限（全ステップは重い）
+    sample_steps = states[1000:min(3000, len(states))]
+    
+    for st in sample_steps:
         pos = st['position'] if isinstance(st, dict) else st.position
         vel = st['Lambda_F'] if isinstance(st, dict) else st.Lambda_F
         act = st['is_active'] if isinstance(st, dict) else st.is_active
         
         # x_probe付近の薄帯での流速
-        mask = act & (np.abs(pos[:,0] - x_probe) < 1.0)
-        if np.any(mask):
-            vals.append(np.mean(vel[mask, 0]))  # x方向流速の平均
+        mask = act & (np.abs(pos[:,0] - x_probe) < 3.0)  # 幅を少し広げる
+        
+        if np.sum(mask) > 5:  # 最小粒子数チェック
+            u_vals = vel[mask, 0]
+            # 逆流を除外（負の速度は無視）
+            u_positive = u_vals[u_vals > 0]
+            if len(u_positive) > 0:
+                vals.append(np.mean(u_positive))
     
-    return float(np.mean(vals)) if vals else config.Lambda_F_inlet
+    if vals:
+        U_eff = float(np.median(vals))  # 中央値の方がロバスト
+        # 物理的に妥当な範囲にクリップ
+        U_eff = np.clip(U_eff, 
+                       config.Lambda_F_inlet * 0.7,
+                       config.Lambda_F_inlet * 1.0)
+    else:
+        U_eff = config.Lambda_F_inlet * 0.9
+    
+    return U_eff
 
 def lift_coefficient_ring_binned(state, config, n_bins=64):
     """等角ビンCL計算（粒子バイアス除去）"""
