@@ -77,8 +77,8 @@ class GETWindConfig(NamedTuple):
     
     # 幾何MAP用パラメータ
     shear_instability_strength: float = 1.0   # せん断層不安定性
-    vortex_formation_noise: float = 1.0       # 渦形成領域の乱流強度
-    wake_turbulence_factor: float = 1.0       # 後流乱流係数
+    vortex_formation_noise: float = 1.5       # 渦形成領域の乱流強度
+    wake_turbulence_factor: float = 0.8       # 後流乱流係数
     
     # 粒子パラメータ
     particles_per_step: float = 5.0
@@ -911,34 +911,6 @@ def physics_step_v63(state: ParticleState,
         new_Lambda_F = jnp.where(
             is_DeltaLambdaC,
             new_Lambda_F + DeltaLambdaC_noise,
-            new_Lambda_F
-        )
-        
-        # ✨ NEW: 幾何MAP駆動の摂動追加
-        # せん断層での不安定性
-        shear_key = random.fold_in(key, i * 8000)
-        shear_noise = random.normal(shear_key, (2,)) * local_shear * config.shear_instability_strength * 0.1
-        new_Lambda_F = jnp.where(
-            local_shear > 0.5,
-            new_Lambda_F + shear_noise,
-            new_Lambda_F
-        )
-        
-        # 渦形成領域でのノイズ
-        vortex_key = random.fold_in(key, i * 9000)
-        formation_noise = random.normal(vortex_key, (2,)) * local_vortex_formation * config.vortex_formation_noise * 0.15
-        new_Lambda_F = jnp.where(
-            local_vortex_formation > 0.5,
-            new_Lambda_F + formation_noise,
-            new_Lambda_F
-        )
-        
-        # 後流での乱流
-        wake_key = random.fold_in(key, i * 10000)
-        wake_turb = random.normal(wake_key, (2,)) * local_wake * config.wake_turbulence_factor * 0.08
-        new_Lambda_F = jnp.where(
-            local_wake > 0.3,
-            new_Lambda_F + wake_turb,
             new_Lambda_F
         )
         
