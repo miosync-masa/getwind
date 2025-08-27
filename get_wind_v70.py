@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+##!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 GET Wind™ v7.1 - Lambda Native 3D Edition (Improved)
@@ -108,6 +108,12 @@ class ParticleState3D(NamedTuple):
 # 改善版：セルリストによる近傍探索
 # ==============================
 
+# 27近傍のオフセット（静的定数）
+NEIGHBOR_OFFSETS = jnp.array(
+    [[dx, dy, dz] for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)],
+    dtype=jnp.int32
+)
+
 @jit
 def build_cell_list(positions: jnp.ndarray,
                    cell_size: float,
@@ -128,36 +134,103 @@ def build_cell_list(positions: jnp.ndarray,
     # セルインデックス（1D化）
     cell_idx = cell_x * (ny * nz) + cell_y * nz + cell_z
     
-    return cell_idx, nx, ny, nz
+    return cell_idx, nx, ny, nz, cell_x, cell_y, cell_z
 
-@jit
-def find_neighbors_cell_based(positions: jnp.ndarray,
-                             active_mask: jnp.ndarray,
-                             cell_idx: jnp.ndarray,
-                             radius: float = 30.0):
-    """セルベースの近傍探索（効率的）"""
+@partial(jit, static_argnums=(5,))
+def find_neighbors_cell_based_true(positions: jnp.ndarray,
+                                  active_mask: jnp.ndarray,
+                                  cell_info: Tuple,
+                                  grid_sizes: Tuple,
+                                  radius: float,
+                                  max_neighbors: int = 30):
+    """真のセルベース近傍探索（O(N×27×k)）"""
     
+    cell_idx, cell_x, cell_y, cell_z = cell_info
+    nx, ny, nz = grid_sizes
     N = positions.shape[0]
-    MAX_NEIGHBORS = 30  # 静的に定義
     
-    # 簡易版：全ペア距離（将来的にセルリスト完全実装）
-    # TODO: 27近傍セルのみ探索する完全版
+    # cell_idでソート
+    order = jnp.argsort(cell_idx)
+    cell_id_sorted = cell_idx[order]
     
-    pos_i = positions[:, None, :]
-    pos_j = positions[None, :, :]
-    distances = jnp.linalg.norm(pos_i - pos_j, axis=2)
+    # CSRインデックス（各cellの開始位置）
+    num_cells = nx * ny * nz
+    counts = jnp.zeros(num_cells, dtype=jnp.int32)
+    counts = counts.at[cell_id_sorted].add(1)
+    starts = jnp.concatenate([jnp.array([0], dtype=jnp.int32), jnp.cumsum(counts[:-1])])
+    ends = starts + counts
     
-    mask = active_mask[None, :] & active_mask[:, None]
-    mask = mask & (distances > 0) & (distances < radius)
-    distances = jnp.where(mask, distances, jnp.inf)
+    def find_neighbors_for_particle(i):
+        """各粒子iの近傍を27セルから探索"""
+        # 粒子iのセル座標
+        cxi, cyi, czi = cell_x[i], cell_y[i], cell_z[i]
+        
+        # 27近傍セルの座標
+        nbr_x = jnp.clip(cxi + NEIGHBOR_OFFSETS[:, 0], 0, nx-1)
+        nbr_y = jnp.clip(cyi + NEIGHBOR_OFFSETS[:, 1], 0, ny-1)
+        nbr_z = jnp.clip(czi + NEIGHBOR_OFFSETS[:, 2], 0, nz-1)
+        nbr_id = nbr_x * (ny * nz) + nbr_y * nz + nbr_z
+        
+        # 各セルの粒子インデックス範囲を収集
+        nbr_starts = starts[nbr_id]
+        nbr_ends = ends[nbr_id]
+        total_candidates = jnp.sum(nbr_ends - nbr_starts)
+        
+        # 候補が0の場合
+        def empty_case(_):
+            return (jnp.full(max_neighbors, i, dtype=jnp.int32),
+                   jnp.zeros(max_neighbors, dtype=bool),
+                   jnp.full(max_neighbors, jnp.inf))
+        
+        # 候補がある場合
+        def nonempty_case(_):
+            # 27セルから候補粒子を収集（簡易版：最大100個まで）
+            MAX_CANDIDATES = 100
+            candidates = jnp.full(MAX_CANDIDATES, -1, dtype=jnp.int32)
+            idx = 0
+            
+            for k in range(27):
+                start = nbr_starts[k]
+                end = nbr_ends[k]
+                n = end - start
+                if n > 0:
+                    # このセルの粒子インデックスを追加
+                    cell_particles = order[start:end]
+                    n_to_add = jnp.minimum(n, MAX_CANDIDATES - idx)
+                    candidates = candidates.at[idx:idx+n_to_add].set(cell_particles[:n_to_add])
+                    idx += n_to_add
+                    if idx >= MAX_CANDIDATES:
+                        break
+            
+            # 有効な候補のみ抽出
+            valid_candidates = candidates >= 0
+            candidates = jnp.where(valid_candidates, candidates, 0)
+            
+            # 距離計算
+            pos_i = positions[i]
+            pos_j = positions[candidates]
+            distances = jnp.linalg.norm(pos_j - pos_i, axis=1)
+            
+            # 自分自身と非活性、半径外を除外
+            valid = valid_candidates & (candidates != i) & active_mask[candidates] & (distances < radius)
+            distances = jnp.where(valid, distances, jnp.inf)
+            
+            # 近い順にソート
+            sorted_idx = jnp.argsort(distances)
+            top_k = sorted_idx[:max_neighbors]
+            
+            neighbor_idx = candidates[top_k]
+            neighbor_dist = distances[top_k]
+            neighbor_valid = neighbor_dist < radius
+            
+            return neighbor_idx, neighbor_valid, neighbor_dist
+        
+        return lax.cond(total_candidates == 0, empty_case, nonempty_case, operand=None)
     
-    sorted_idx = jnp.argsort(distances, axis=1)
-    # 静的スライシング
-    neighbor_indices = sorted_idx[:, :MAX_NEIGHBORS]
-    neighbor_distances = jnp.take_along_axis(distances, neighbor_indices, axis=1)
-    neighbor_mask = neighbor_distances < radius
+    # 全粒子について並列実行
+    results = vmap(find_neighbors_for_particle)(jnp.arange(N))
     
-    return neighbor_indices, neighbor_mask, neighbor_distances
+    return results[0], results[1], results[2]
 
 # ==============================
 # 改善版：動的グリッドサイズ対応の補間
@@ -255,6 +328,7 @@ def apply_boundary_conditions(position: jnp.ndarray,
     # 条件分岐
     is_reflect = config.boundary_type == 0
     is_periodic = config.boundary_type == 1
+    is_absorb = config.boundary_type == 2
     
     new_vel = new_vel.at[0].set(jnp.where(is_reflect, reflect_vel_x, velocity[0]))
     new_vel = new_vel.at[1].set(jnp.where(is_reflect, reflect_vel_y, velocity[1]))
@@ -273,8 +347,12 @@ def apply_boundary_conditions(position: jnp.ndarray,
                   jnp.where(is_periodic, periodic_pos_z, position[2]))
     )
     
-    # 活性判定（X方向出口で非活性化）
-    is_active = ~at_x_max
+    # 活性判定（吸収境界のみで非活性化）
+    is_active = jnp.where(
+        is_absorb,
+        ~(at_x_max | at_x_min | at_y_min | at_y_max | at_z_min | at_z_max),
+        True
+    )
     
     return new_pos, new_vel, is_active
 
@@ -365,7 +443,7 @@ def physics_step_lambda_native(
     active_mask = state.is_active
     
     # セルリスト構築（効率化）
-    cell_idx, nx, ny, nz = build_cell_list(
+    cell_idx, nx, ny, nz, cell_x, cell_y, cell_z = build_cell_list(
         state.position,
         config.neighbor_radius,
         config.domain_width,
@@ -373,9 +451,14 @@ def physics_step_lambda_native(
         config.domain_depth
     )
     
-    # 近傍探索（改善版）
-    neighbor_indices, neighbor_mask, neighbor_distances = find_neighbors_cell_based(
-        state.position, active_mask, cell_idx, config.neighbor_radius
+    # 近傍探索（真のセルベース実装 - O(N×27×k)）
+    neighbor_indices, neighbor_mask, neighbor_distances = find_neighbors_cell_based_true(
+        state.position,
+        active_mask,
+        (cell_idx, cell_x, cell_y, cell_z),
+        (nx, ny, nz),
+        config.neighbor_radius,
+        config.max_neighbors
     )
     
     def update_particle(i):
@@ -668,7 +751,7 @@ class LambdaMapManager:
             return {}
         
         print(f"  Loading {filename}...", end="")
-        data = np.load(filepath, allow_pickle=True)
+        data = np.load(filepath, allow_pickle=False)  # セキュリティ向上
         
         result = {}
         for key in data.keys():
