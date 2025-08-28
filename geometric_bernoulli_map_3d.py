@@ -46,7 +46,7 @@ class Obstacle3DConfig:
 @dataclass
 class Flow3DConfig:
     """3D流れの条件"""
-    U_inf: float = 0.075    # 一様流速度 [m/s] (Re=200に調整)
+    U_inf: float = 0.015    # 一様流速度 [m/s] (Re=200, D=20cm)
     V_inf: float = 0.0       # Y方向速度成分
     W_inf: float = 0.0       # Z方向速度成分
     rho_inf: float = 1.225   # 基準密度 [kg/m³]
@@ -510,20 +510,21 @@ class GeometricBernoulli3D:
         b = np.zeros((nx, ny, nz), dtype=np.float64)
         
         # 境界条件: ∂ϕ/∂n = g = -U·n
+        # ゴーストセル法では係数は 2g/Δ になる
         # X面での寄与: n = ±ex
         if abs(Ux) > 1e-10:
-            b[solid_plus_x] += (-Ux) / dx   # +x面: n=+ex, g=-Ux
-            b[solid_minus_x] += (+Ux) / dx  # -x面: n=-ex, g=+Ux
+            b[solid_plus_x] += (-Ux) * (2.0 / dx)   # +x面: n=+ex, g=-Ux
+            b[solid_minus_x] += (+Ux) * (2.0 / dx)  # -x面: n=-ex, g=+Ux
             
         # Y面での寄与: n = ±ey
         if abs(Uy) > 1e-10:
-            b[solid_plus_y] += (-Uy) / dy   # +y面: n=+ey, g=-Uy
-            b[solid_minus_y] += (+Uy) / dy  # -y面: n=-ey, g=+Uy
+            b[solid_plus_y] += (-Uy) * (2.0 / dy)   # +y面: n=+ey, g=-Uy
+            b[solid_minus_y] += (+Uy) * (2.0 / dy)  # -y面: n=-ey, g=+Uy
             
         # Z面での寄与: n = ±ez
         if abs(Uz) > 1e-10:
-            b[solid_plus_z] += (-Uz) / dz   # +z面: n=+ez, g=-Uz
-            b[solid_minus_z] += (+Uz) / dz  # -z面: n=-ez, g=+Uz
+            b[solid_plus_z] += (-Uz) * (2.0 / dz)   # +z面: n=+ez, g=-Uz
+            b[solid_minus_z] += (+Uz) * (2.0 / dz)  # -z面: n=-ez, g=+Uz
         
         # === 2.5 Neumann整合性（右辺の平均ゼロ化） ===
         b_mean = b[fluid_mask].mean()
