@@ -826,13 +826,28 @@ class GeometricBernoulli3D:
         
         return u_new, v_new, w_new
     
+    def _grad(self, arr, h, axis):
+        """統一的な勾配計算（GPU/CPU自動切り替え）"""
+        return xp.gradient(arr, h, axis=axis)
+    
     def _compute_divergence(self, u: np.ndarray, v: np.ndarray, 
                           w: np.ndarray) -> np.ndarray:
         """速度場の発散を計算"""
-        dudx = xp.gradient(u, self.grid.dx, axis=0)
-        dvdy = xp.gradient(v, self.grid.dy, axis=1)
-        dwdz = xp.gradient(w, self.grid.dz, axis=2)
-        return dudx + dvdy + dwdz
+        dudx = self._grad(u, self.grid.dx, 0)
+        dvdy = self._grad(v, self.grid.dy, 1)
+        dwdz = self._grad(w, self.grid.dz, 2)
+        div_u = dudx + dvdy + dwdz
+        
+        # 無次元化評価
+        L = min(self.grid.dx, self.grid.dy, self.grid.dz)
+        div_star = div_u * L / self.flow.U_inf
+        if HAS_GPU:
+            div_star_l2 = float(xp.sqrt(xp.mean(div_star**2)))
+        else:
+            div_star_l2 = xp.sqrt(xp.mean(div_star**2))
+        print(f"    ||∇·u||* (L2 normalized) = {div_star_l2:.3e}")
+        
+        return div_u
     
     def _solve_poisson_3d(self, rhs: np.ndarray, max_iter: int = 100,
                          tol: float = 1e-6) -> np.ndarray:
@@ -896,26 +911,47 @@ class GeometricBernoulli3D:
         # 圧力係数（無次元）
         Cp = 1.0 - V_squared / U_inf**2
         
+        # 動圧
+        q_inf = 0.5 * rho_inf * U_inf**2
+        
         # 静圧（次元あり）[Pa]
-        pressure = p_inf + 0.5 * rho_inf * U_inf**2 * Cp
+        pressure = p_inf + q_inf * Cp
         
         # 理想流では密度・温度は一定（非圧縮性）
-        density = np.ones_like(pressure) * rho_inf
-        temperature = np.ones_like(pressure) * self.flow.temperature_inf
+        density = xp.ones_like(pressure) * rho_inf
+        temperature = xp.ones_like(pressure) * self.flow.temperature_inf
         
         # 正規化して返す（可視化用）
         pressure_normalized = pressure / p_inf
         density_normalized = density / rho_inf
         
-        print(f"    Pressure range [Pa]: {pressure.min():.1f} - {pressure.max():.1f}")
-        print(f"    Pressure range [p/p∞]: {pressure.min()/p_inf:.6f} - {pressure.max()/p_inf:.6f}")
-        print(f"    Cp range: {Cp.min():.3f} - {Cp.max():.3f}")
+        # 差圧表示（動圧が小さい時用）
+        dp = pressure - p_inf
+        if HAS_GPU and hasattr(dp, 'get'):
+            dp_min, dp_max = float(dp.min()), float(dp.max())
+        else:
+            dp_min, dp_max = dp.min(), dp.max()
+            
+        print(f"    Δp range [Pa]: {dp_min:.6e} - {dp_max:.6e}")
+        print(f"    q_inf = 0.5*ρ*U² = {q_inf:.6e} Pa")
+        print(f"    Pressure range [Pa]: {p_inf + dp_min:.3f} - {p_inf + dp_max:.3f}")
+        print(f"    Cp range: {float(Cp.min()):.3f} - {float(Cp.max()):.3f}")
         
         # ベルヌーイの定理の検証（流線上で全圧一定か）
         total_pressure = pressure + 0.5 * rho_inf * V_squared
-        tp_std = np.std(total_pressure[V_squared > 0.1*U_inf**2])  # 流れがある領域で
-        tp_mean = np.mean(total_pressure[V_squared > 0.1*U_inf**2])
-        print(f"    Total pressure variation: {tp_std/tp_mean:.2e} (should be ~0 for ideal flow)")
+        if HAS_GPU:
+            mask = V_squared > 0.1*U_inf**2
+            if xp.any(mask):
+                tp_std = float(xp.std(total_pressure[mask]))
+                tp_mean = float(xp.mean(total_pressure[mask]))
+            else:
+                tp_std = tp_mean = 0.0
+        else:
+            tp_std = xp.std(total_pressure[V_squared > 0.1*U_inf**2])
+            tp_mean = xp.mean(total_pressure[V_squared > 0.1*U_inf**2])
+            
+        if tp_mean > 0:
+            print(f"    Total pressure variation: {tp_std/tp_mean:.2e} (should be ~0 for ideal flow)")
         
         return {
             'pressure': pressure_normalized,  # p/p∞（後方互換性）
@@ -1427,7 +1463,7 @@ class GeometricBernoulli3D:
                 )
                 ax.add_patch(rect)
         
-        plt.colorbar(im, ax=ax, fraction=0.046)
+        plt.colorbar(im, ax=ax, fraction=0.046, format="%.2e")
         ax.set_title(f"{field_name} - {title_suffix} {'[GPU]' if HAS_GPU else '[CPU]'}")
         plt.tight_layout()
         plt.show()
@@ -1525,5 +1561,5 @@ if __name__ == "__main__":
     
     print("\n" + "="*70)
     print("✨ 3D Geometric Bernoulli Maps Generation Complete!")
-    print("🚀 Ready for GET Wind™ v7.0 - Ultimate 3D Edition!")
+    print("🚀 Ready for GET Wind™ v7.0 - Ultimate 3D AMG Edition!")
     print("="*70)
