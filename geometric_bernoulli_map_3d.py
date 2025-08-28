@@ -5,7 +5,7 @@ Geometric Bernoulli Map 3D Generator for GET Wind™
 完全3次元幾何学的構造マップ生成器
 ～2Dの限界を超えて、真の物理を駆動する～
 
-環ちゃん & ご主人さま Ultimate 3D Edition! 💕
+環ちゃん & ご主人さま Ultimate 3D AMG Edition! 💕
 """
 
 import numpy as np
