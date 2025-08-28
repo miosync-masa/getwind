@@ -506,6 +506,12 @@ class GeometricBernoulli3D:
         solid_plus_y, solid_minus_y = get_solid_neighbors(solid_mask, 1)
         solid_plus_z, solid_minus_z = get_solid_neighbors(solid_mask, 2)
         
+        # === 1.5 流体投影関数（solid_maskが必要）===
+        def project_fluid(arr):
+            out = arr.copy()
+            out[solid_mask] = 0.0
+            return out
+        
         # === 2. 右辺ベクトルbの構築（迎角対応, 係数: 2g/Δ） ===
         b = np.zeros((nx, ny, nz), dtype=np.float64)
         
@@ -608,12 +614,6 @@ class GeometricBernoulli3D:
             Aphi[solid_mask] = phi[solid_mask]
             
             return Aphi
-        
-        # 流体領域への投影関数
-        def project_fluid(arr):
-            out = arr.copy()
-            out[solid_mask] = 0.0
-            return out
         
         # デバッグ出力
         print(f"      b range: {b.min():.3e} .. {b.max():.3e},  ||b||₂={np.linalg.norm(b):.3e}")
