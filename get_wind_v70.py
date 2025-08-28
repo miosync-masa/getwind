@@ -88,7 +88,7 @@ class GETWindConfig3D(NamedTuple):
     vortex_coupling: float = 0.15        # 渦相互作用
     
     # 時定数 [s]
-    map_relax_tau: float = 0.5      # マップへ緩和する時間
+    map_relax_tau: float = 0.3      # マップへ緩和する時間（0.5→0.3秒に短縮）
     interaction_tau: float = 1.5    # 近傍結合の時間
     
     # 速度上限（物理安全キャップ）
@@ -504,11 +504,35 @@ def physics_step_lambda_native(
         # 剥離判定（緩和版）
         velocity_deficit = jnp.linalg.norm(ideal_Lambda_F - current_velocity)
         
-        # 剥離閾値
-        is_separated = velocity_deficit > config.separation_threshold
+        # 剥離閾値を大幅に緩和（元の100倍）
+        # 風速0.015m/sの環境で剥離が発生しすぎてる問題を回避
+        is_separated = velocity_deficit > (config.separation_threshold * 100.0)  # 0.5m/sまで許容
         
         # 速度更新（加速度×dt）
         new_Lambda_F = current_velocity + config.dt * (a_map + a_int)
+        
+        # 適応的粘性減衰（物理的に正しい実装）
+        # 理想流からの偏差に基づく減衰
+        current_speed = jnp.linalg.norm(new_Lambda_F) + 1e-8
+        ideal_speed = jnp.linalg.norm(ideal_Lambda_F) + 1e-8
+        
+        # 理想流より速い場合のみ減衰（過剰な速度を平均流へ戻す）
+        speed_ratio = current_speed / ideal_speed
+        viscous_damping = jnp.where(
+            speed_ratio > 1.1,  # 理想流の110%以上
+            0.98,               # 強い減衰
+            jnp.where(
+                speed_ratio > 1.0,  # 理想流より少し速い
+                0.995,              # 弱い減衰
+                1.0                 # 理想流以下なら減衰なし
+            )
+        )
+        
+        # 渦構造による追加減衰（Q_Lambda高い領域）
+        vortex_damping = 1.0 - 0.01 * jnp.clip(local_fields['Q_Lambda'], 0, 1)
+        
+        # 複合減衰の適用
+        new_Lambda_F = new_Lambda_F * viscous_damping * vortex_damping
         
         # 安全キャップ（方向維持で大きさだけ制限）
         speed = jnp.linalg.norm(new_Lambda_F) + 1e-8
@@ -564,10 +588,11 @@ def physics_step_lambda_native(
         perturbation_strength = jnp.minimum(structural_stress * 3.0 * w_charge * w_eff, 0.05)
         perturbation = perturbation_direction * perturbation_strength
         
-        # ΔΛCイベント時の摂動追加
+        # ΔΛCイベント時の摂動追加（減衰付き）
+        perturbation_decay = 0.95  # 既存速度に減衰を適用
         new_Lambda_F = jnp.where(
             is_DeltaLambdaC,
-            new_Lambda_F + perturbation,
+            new_Lambda_F * perturbation_decay + perturbation,
             new_Lambda_F
         )
         
@@ -1098,7 +1123,7 @@ if __name__ == "__main__":
         vortex_coupling=0.15,
         
         # 時定数 [s]
-        map_relax_tau=0.5,      # マップへ緩和する時間
+        map_relax_tau=0.3,      # マップへ緩和する時間（0.5→0.3秒に短縮）
         interaction_tau=1.5,    # 近傍結合の時間
         
         # 速度上限（物理安全キャップ）
