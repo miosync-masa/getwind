@@ -1022,48 +1022,45 @@ class GeometricBernoulli3D:
         }
     
     def _calculate_boundary_map(self) -> Dict[str, np.ndarray]:
-        """Map 4: 境界層ポテンシャル（理想流では境界層厚さゼロ）"""
+        """Map 4: 境界層ポテンシャル（理想流では境界層厚さゼロ）- ベクトル化版"""
         
         # 理想流では境界層なし、剥離なし
         # ここでは「将来の粘性計算用」のマスク場のみ用意
         
-        separation_potential = np.zeros((self.grid.nx, self.grid.ny, self.grid.nz))
-        boundary_layer_mask = np.zeros_like(separation_potential)
-        wall_distance = np.zeros_like(separation_potential)
-        
         cx, cy, cz = self.obstacle.center_x, self.obstacle.center_y, self.obstacle.center_z
         R = self.obstacle.size
         
-        # 壁面からの距離場を計算（粘性計算で使用）
-        for i in range(self.grid.nx):
-            for j in range(self.grid.ny):
-                for k in range(self.grid.nz):
-                    x, y, z = self.x[i], self.y[j], self.z[k]
-                    
-                    if self.obstacle.shape_type == 'cylinder':
-                        # 円柱表面からの距離
-                        r = np.sqrt((x-cx)**2 + (y-cy)**2)
-                        wall_distance[i,j,k] = max(0, r - R)
-                        
-                        # 剥離ポテンシャル位置のマーキング（理想流では使わない）
-                        theta = np.arctan2(y-cy, x-cx)
-                        if r > R and r < R + 10:
-                            # 円柱の場合、約90度で剥離する可能性
-                            if np.abs(theta) > np.pi/2:
-                                separation_potential[i,j,k] = np.exp(-(r-R)/5)
-                                
-                    elif self.obstacle.shape_type == 'square':
-                        # 角柱表面からの最短距離（簡易版）
-                        dx = max(0, np.abs(x-cx) - R)
-                        dy = max(0, np.abs(y-cy) - R)
-                        dz = max(0, np.abs(z-cz) - self.obstacle.span/2)
-                        wall_distance[i,j,k] = np.sqrt(dx**2 + dy**2 + dz**2)
-                        
-                        # エッジ部の剥離ポテンシャル
-                        at_edge = (np.abs(np.abs(x-cx) - R) < 2 or 
-                                  np.abs(np.abs(y-cy) - R) < 2)
-                        if at_edge:
-                            separation_potential[i,j,k] = 1.0
+        # 全グリッド点の座標を一度に生成
+        X, Y, Z = xp.meshgrid(self.x, self.y, self.z, indexing='ij')
+        
+        # ベクトル化版の距離場計算
+        if self.obstacle.shape_type == 'cylinder':
+            # 円柱表面からの距離
+            r = xp.sqrt((X-cx)**2 + (Y-cy)**2)
+            wall_distance = xp.maximum(0, r - R)
+            
+            # 剥離ポテンシャル位置のマーキング（理想流では使わない）
+            theta = xp.arctan2(Y-cy, X-cx)
+            mask = (r > R) & (r < R + 10)
+            separation_potential = xp.zeros_like(X)
+            separation_potential[mask & (xp.abs(theta) > xp.pi/2)] = xp.exp(-(r[mask & (xp.abs(theta) > xp.pi/2)]-R)/5)
+                            
+        elif self.obstacle.shape_type == 'square':
+            # 角柱表面からの最短距離（簡易版）
+            dx = xp.maximum(0, xp.abs(X-cx) - R)
+            dy = xp.maximum(0, xp.abs(Y-cy) - R)
+            dz = xp.maximum(0, xp.abs(Z-cz) - self.obstacle.span/2)
+            wall_distance = xp.sqrt(dx**2 + dy**2 + dz**2)
+            
+            # エッジ部の剥離ポテンシャル
+            at_edge = (xp.abs(xp.abs(X-cx) - R) < 2) | (xp.abs(xp.abs(Y-cy) - R) < 2)
+            separation_potential = xp.zeros_like(X)
+            separation_potential[at_edge] = 1.0
+        else:
+            wall_distance = xp.zeros((self.grid.nx, self.grid.ny, self.grid.nz))
+            separation_potential = xp.zeros_like(wall_distance)
+        
+        boundary_layer_mask = xp.zeros_like(separation_potential)
         
         print("    Boundary layer maps prepared (ideal flow: no actual BL)")
         
@@ -1074,56 +1071,45 @@ class GeometricBernoulli3D:
         }
     
     def _calculate_formation_map(self) -> Dict[str, np.ndarray]:
-        """Map 5: 渦形成ポテンシャル（理想流では渦なし）"""
+        """Map 5: 渦形成ポテンシャル（理想流では渦なし）- ベクトル化版"""
         
         # 理想流（ポテンシャル流）は無渦 (∇×u = 0)
         # ここでは「粘性計算で渦が発生しやすい領域」のマーキングのみ
         
-        vortex_formation_potential = np.zeros((self.grid.nx, self.grid.ny, self.grid.nz))
-        horseshoe_potential = np.zeros_like(vortex_formation_potential)
-        tip_vortex_potential = np.zeros_like(vortex_formation_potential)
-        
         cx, cy, cz = self.obstacle.center_x, self.obstacle.center_y, self.obstacle.center_z
         R = self.obstacle.size
         
+        # 全グリッド点の座標を一度に生成
+        X, Y, Z = xp.meshgrid(self.x, self.y, self.z, indexing='ij')
+        
         # 馬蹄渦が形成されやすい領域（障害物前面の地面付近）
-        for i in range(self.grid.nx):
-            for j in range(self.grid.ny):
-                x, y = self.x[i], self.y[j]
-                
-                # 障害物前面
-                if x < cx and x > cx - 3*R:
-                    for k in range(int(self.grid.nz * 0.2)):  # 下部20%
-                        z = self.z[k]
-                        dist_to_front = np.sqrt((x-cx+R)**2 + (y-cy)**2)
-                        
-                        if dist_to_front < 2*R:
-                            # ポテンシャルのみマーク（実際の渦は粘性で発生）
-                            horseshoe_potential[i,j,k] = np.exp(-dist_to_front/R)
+        horseshoe_potential = xp.zeros_like(X)
+        x_front_mask = (X < cx) & (X > cx - 3*R)
+        z_bottom_mask = Z < self.grid.z_max * 0.2  # 下部20%
+        
+        dist_to_front = xp.sqrt((X-cx+R)**2 + (Y-cy)**2)
+        front_mask = x_front_mask & z_bottom_mask & (dist_to_front < 2*R)
+        horseshoe_potential[front_mask] = xp.exp(-dist_to_front[front_mask]/R)
         
         # 端部渦のポテンシャル（有限スパンの影響）
+        tip_vortex_potential = xp.zeros_like(X)
         if self.obstacle.shape_type in ['cylinder', 'square']:
-            for k in range(self.grid.nz):
-                z_norm = np.abs(self.z[k] - cz) / (self.obstacle.span/2)
-                
-                # スパン端部近傍
-                if z_norm > 0.8:
-                    # 端部効果のポテンシャル
-                    tip_vortex_potential[:,:,k] = np.exp(-5*(z_norm-1.0)**2)
+            z_norm = xp.abs(Z - cz) / (self.obstacle.span/2)
+            tip_mask = z_norm > 0.8
+            tip_vortex_potential[tip_mask] = xp.exp(-5*(z_norm[tip_mask]-1.0)**2)
         
         # カルマン渦列のポテンシャル（後流領域のマーク）
-        for i in range(self.grid.nx):
-            x_wake = self.x[i] - cx - R
-            
-            if x_wake > 0 and x_wake < 20*R:
-                for j in range(self.grid.ny):
-                    for k in range(self.grid.nz):
-                        y_wake = np.abs(self.y[j] - cy)
-                        
-                        # 後流幅内
-                        if y_wake < 3*R:
-                            # 渦形成領域のポテンシャル（粘性で活性化）
-                            vortex_formation_potential[i,j,k] = np.exp(-x_wake/(10*R)) * np.exp(-(y_wake/(2*R))**2)
+        vortex_formation_potential = xp.zeros_like(X)
+        x_wake = X - cx - R
+        wake_mask = (x_wake > 0) & (x_wake < 20*R)
+        y_wake = xp.abs(Y - cy)
+        wake_width_mask = y_wake < 3*R
+        
+        final_mask = wake_mask & wake_width_mask
+        vortex_formation_potential[final_mask] = (
+            xp.exp(-x_wake[final_mask]/(10*R)) * 
+            xp.exp(-(y_wake[final_mask]/(2*R))**2)
+        )
         
         print("    Vortex formation potentials prepared (ideal flow: irrotational)")
         
@@ -1146,23 +1132,23 @@ class GeometricBernoulli3D:
         # === 1. 完全な3x3速度勾配テンソル ∇u の計算 ===
         # Lambda_core = ∂u_i/∂x_j (9成分にflatten)
         print("    - Calculating velocity gradients...")
-        Lambda_core = np.zeros((self.grid.nx, self.grid.ny, self.grid.nz, 9))
+        Lambda_core = xp.zeros((self.grid.nx, self.grid.ny, self.grid.nz, 9))
         
-        # 各成分を計算（中心差分）
+        # 各成分を計算（中心差分）- xp.gradientを使用
         # ∂u/∂x, ∂u/∂y, ∂u/∂z
-        dudx = np.gradient(u, self.grid.dx, axis=0)
-        dudy = np.gradient(u, self.grid.dy, axis=1)
-        dudz = np.gradient(u, self.grid.dz, axis=2)
+        dudx = xp.gradient(u, self.grid.dx, axis=0)
+        dudy = xp.gradient(u, self.grid.dy, axis=1)
+        dudz = xp.gradient(u, self.grid.dz, axis=2)
         
         # ∂v/∂x, ∂v/∂y, ∂v/∂z
-        dvdx = np.gradient(v, self.grid.dx, axis=0)
-        dvdy = np.gradient(v, self.grid.dy, axis=1)
-        dvdz = np.gradient(v, self.grid.dz, axis=2)
+        dvdx = xp.gradient(v, self.grid.dx, axis=0)
+        dvdy = xp.gradient(v, self.grid.dy, axis=1)
+        dvdz = xp.gradient(v, self.grid.dz, axis=2)
         
         # ∂w/∂x, ∂w/∂y, ∂w/∂z
-        dwdx = np.gradient(w, self.grid.dx, axis=0)
-        dwdy = np.gradient(w, self.grid.dy, axis=1)
-        dwdz = np.gradient(w, self.grid.dz, axis=2)
+        dwdx = xp.gradient(w, self.grid.dx, axis=0)
+        dwdy = xp.gradient(w, self.grid.dy, axis=1)
+        dwdz = xp.gradient(w, self.grid.dz, axis=2)
         
         # テンソル成分を格納（row-major order）
         Lambda_core[:,:,:,0] = dudx  # (0,0)
@@ -1177,24 +1163,24 @@ class GeometricBernoulli3D:
         
         # === 2. テンション密度 ρT（速度の大きさ）===
         print("    - Computing tension density...")
-        rho_T = np.sqrt(u**2 + v**2 + w**2)
+        rho_T = xp.sqrt(u**2 + v**2 + w**2)
         
         # === 3. 構造同期率 σₛ（圧力-速度相関）===
         print("    - Computing structural synchronization...")
         
         # 圧力勾配
-        grad_p_x = np.gradient(pressure, self.grid.dx, axis=0)
-        grad_p_y = np.gradient(pressure, self.grid.dy, axis=1)
-        grad_p_z = np.gradient(pressure, self.grid.dz, axis=2)
+        grad_p_x = xp.gradient(pressure, self.grid.dx, axis=0)
+        grad_p_y = xp.gradient(pressure, self.grid.dy, axis=1)
+        grad_p_z = xp.gradient(pressure, self.grid.dz, axis=2)
         
         # テンション密度の勾配
-        grad_rho_T_x = np.gradient(rho_T, self.grid.dx, axis=0)
-        grad_rho_T_y = np.gradient(rho_T, self.grid.dy, axis=1)
-        grad_rho_T_z = np.gradient(rho_T, self.grid.dz, axis=2)
+        grad_rho_T_x = xp.gradient(rho_T, self.grid.dx, axis=0)
+        grad_rho_T_y = xp.gradient(rho_T, self.grid.dy, axis=1)
+        grad_rho_T_z = xp.gradient(rho_T, self.grid.dz, axis=2)
         
         # 同期率：∇ρT・(u,v,w) / |∇ρT||u|
         numerator = grad_rho_T_x*u + grad_rho_T_y*v + grad_rho_T_z*w
-        grad_rho_T_mag = np.sqrt(grad_rho_T_x**2 + grad_rho_T_y**2 + grad_rho_T_z**2)
+        grad_rho_T_mag = xp.sqrt(grad_rho_T_x**2 + grad_rho_T_y**2 + grad_rho_T_z**2)
         denominator = grad_rho_T_mag * rho_T + 1e-8
         sigma_s = numerator / denominator
         
@@ -1207,13 +1193,13 @@ class GeometricBernoulli3D:
         omega_z = dvdx - dudy
         
         # 局所循環強度（ヘリシティ密度の絶対値）
-        local_helicity = np.abs(u*omega_x + v*omega_y + w*omega_z)
+        local_helicity = xp.abs(u*omega_x + v*omega_y + w*omega_z)
         
         # エンストロフィー（渦度の二乗）
         enstrophy = omega_x**2 + omega_y**2 + omega_z**2
         
         # トポロジカルチャージ：循環とエンストロフィーの組み合わせ
-        Q_Lambda = np.sqrt(local_helicity * enstrophy) / (rho_T + 1e-8)
+        Q_Lambda = xp.sqrt(local_helicity * enstrophy) / (rho_T + 1e-8)
         
         # === 5. 追加：構造効率場 η（Λ³理論の重要量）===
         print("    - Computing structural efficiency...")
@@ -1240,13 +1226,13 @@ class GeometricBernoulli3D:
         print("    - Computing emergence potential...")
         
         # 効率の勾配（構造変化が起きやすい場所）
-        grad_eff_x = np.gradient(efficiency, self.grid.dx, axis=0)
-        grad_eff_y = np.gradient(efficiency, self.grid.dy, axis=1)
-        grad_eff_z = np.gradient(efficiency, self.grid.dz, axis=2)
-        grad_eff_mag = np.sqrt(grad_eff_x**2 + grad_eff_y**2 + grad_eff_z**2)
+        grad_eff_x = xp.gradient(efficiency, self.grid.dx, axis=0)
+        grad_eff_y = xp.gradient(efficiency, self.grid.dy, axis=1)
+        grad_eff_z = xp.gradient(efficiency, self.grid.dz, axis=2)
+        grad_eff_mag = xp.sqrt(grad_eff_x**2 + grad_eff_y**2 + grad_eff_z**2)
         
         # 創発ポテンシャル：効率勾配が大きく、かつ同期率が高い領域
-        emergence = grad_eff_mag * np.abs(sigma_s)
+        emergence = grad_eff_mag * xp.abs(sigma_s)
         
         # === 7. スカラー不変量の計算（参考値）===
         print("    - Computing scalar invariants...")
@@ -1264,7 +1250,7 @@ class GeometricBernoulli3D:
         return {
             'Lambda_core': Lambda_core,      # (nx,ny,nz,9) 完全な速度勾配テンソル
             'rho_T': rho_T,                 # (nx,ny,nz) テンション密度
-            'sigma_s': np.clip(sigma_s, -1, 1),  # (nx,ny,nz) 同期率
+            'sigma_s': xp.clip(sigma_s, -1, 1),  # (nx,ny,nz) 同期率
             'Q_Lambda': Q_Lambda,            # (nx,ny,nz) トポロジカルチャージ
             'efficiency': efficiency,        # (nx,ny,nz) 構造効率
             'emergence': emergence,          # (nx,ny,nz) 創発ポテンシャル
@@ -1561,5 +1547,5 @@ if __name__ == "__main__":
     
     print("\n" + "="*70)
     print("✨ 3D Geometric Bernoulli Maps Generation Complete!")
-    print("🚀 Ready for GET Wind™ v7.0 - Ultimate 3D AMG Edition!")
+    print("🚀 Ready for GET Wind™ v7.0 - Ultimate 3D Edition!")
     print("="*70)
