@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GET Wind™ Vortex Analysis - Ultimate Edition
-環ちゃん & ご主人さま Complete Fix! 💕
+GET Wind™ Vortex Analysis — Refactored Ultimate (DBSCAN + Strouhal)
+環ちゃん & ご主人さま 完全版 💕
 
-Ultimate改良版：
-- ファイル名をv6.3に統一
-- 揚力係数の幾何重み追加
-- rFFTによる高速化
-- 自動eps計算
-- Reynolds数の実効値推定
-- Welch法オプション追加
+主な改善:
+- 構成を関数/クラス単位に整理して可読性を向上
+- DBSCAN 検出の auto-eps を堅牢化（第2近傍×係数 + クリップ）
+- Q基準のしきい・最小粒子数を引数化
+- 揚力係数 CL の等角ビン積分をユニットテストしやすく分離
+- rFFT / Welch を選択可能、ピーク精緻化（放物線補間）
+- U_eff 推定を堅牢化（逆流除外・中央値・ドメイン境界チェック）
+- 物理スケール（m/unit, s/step）を config から安全に読取
+- 例外とフォールバックを簡潔化
+
+実行例:
+  python vortex_analysis_refactored.py --file simulation_results_v63_cylinder.npz --method rfft
 """
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import welch
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
+from scipy.signal import welch, find_peaks
 
 # ==============================
 # データ構造
@@ -28,21 +37,58 @@ from dataclasses import dataclass
 
 @dataclass
 class Vortex:
-    """渦の情報"""
     center: np.ndarray      # (x, y)
-    n_particles: int        # 粒子数
-    circulation: float      # 循環
-    cluster_id: int        # DBSCANのクラスタID
-    
+    n_particles: int
+    circulation: float
+    cluster_id: int
+
+# （必要なら使う）
 @dataclass
 class VortexSnapshot:
-    """1ステップの渦情報"""
     step: int
     vortices: List[Vortex]
     total_particles: int
 
+
 # ==============================
-# 渦検出（DBSCAN with adaptive eps）
+# 低レベル・ユーティリティ
+# ==============================
+
+def _safe_get_scales(config) -> Tuple[float, float]:
+    """config から [m/unit], [s/step] を安全に取得（フォールバック付）"""
+    L = getattr(config, "scale_m_per_unit", 0.01)  # 1 unit = 1 cm 既定
+    T = getattr(config, "scale_s_per_step", 1.0)   # dt 自体が秒なら 1
+    return float(L), float(T)
+
+
+def _parabolic_peak_index(power: np.ndarray) -> float:
+    """離散ピーク周り 3点の放物線補間でサブビン推定。戻り値はインデックス。"""
+    k = int(np.argmax(power))
+    if 0 < k < len(power) - 1:
+        y1, y2, y3 = power[k - 1], power[k], power[k + 1]
+        denom = (y1 - 2 * y2 + y3)
+        if denom != 0:
+            delta = 0.5 * (y1 - y3) / denom
+            return float(k + np.clip(delta, -0.5, 0.5))
+    return float(k)
+
+
+# ==============================
+# 渦の循環推定
+# ==============================
+
+def compute_circulation(Lambda_F: np.ndarray, positions: np.ndarray, center: np.ndarray) -> float:
+    """接線方向速度の重み付き平均で循環を簡便推定。"""
+    rel = positions - center
+    r = np.linalg.norm(rel, axis=1) + 1e-8
+    tangent = np.stack([-rel[:, 1], rel[:, 0]], axis=1) / r[:, None]
+    v_t = np.sum(Lambda_F * tangent, axis=1)
+    w = np.exp(-r / 10.0)
+    return float(np.sum(v_t * w) / np.sum(w))
+
+
+# ==============================
+# DBSCAN 渦検出
 # ==============================
 
 def detect_vortices_dbscan(
@@ -50,862 +96,525 @@ def detect_vortices_dbscan(
     Lambda_F: np.ndarray,
     Q_criterion: np.ndarray,
     active_mask: np.ndarray,
+    *,
     eps: Optional[float] = None,
-    min_samples: int = 5,
-    Q_threshold: float = 0.15,
-    auto_eps: bool = True
+    min_samples: int = 8,
+    Q_threshold: float = 0.2,
+    auto_eps: bool = True,
+    auto_eps_k: int = 5,
+    auto_eps_coeff: float = 3.0,
+    auto_eps_clip: Tuple[float, float] = (8.0, 60.0),
 ) -> List[Vortex]:
-    """DBSCANで渦を検出（自動eps対応）"""
-    
-    q_mask = active_mask & (Q_criterion > Q_threshold)
-    vortex_positions = positions[q_mask]
-    vortex_Lambda_F = Lambda_F[q_mask]
-    
-    if len(vortex_positions) < min_samples:
+    """DBSCAN で渦クラスタを検出（auto-eps 強化版）。
+
+    positions: (N,2 or 3) を想定（z を無視して 2D に投影）
+    """
+    mask = (active_mask.astype(bool)) & (Q_criterion > Q_threshold)
+    pts = positions[mask][:, :2]
+    vel = Lambda_F[mask][:, :2]
+
+    if len(pts) < min_samples:
         return []
-    
-    # 自動eps計算
+
     if auto_eps and eps is None:
-        nbrs = NearestNeighbors(n_neighbors=min(5, len(vortex_positions))).fit(vortex_positions)
-        dists, _ = nbrs.kneighbors(vortex_positions)
-        if dists.shape[1] > 1:
-            eps = np.median(dists[:, 1]) * 3.0  # 第2近傍の中央値×3
-        else:
-            eps = 25.0  # フォールバック
+        k = min(auto_eps_k, max(2, len(pts) - 1))
+        nbrs = NearestNeighbors(n_neighbors=k).fit(pts)
+        dists, _ = nbrs.kneighbors(pts)
+        base = np.median(dists[:, 1]) if dists.shape[1] > 1 else 25.0
+        eps = float(np.clip(base * auto_eps_coeff, *auto_eps_clip))
     elif eps is None:
         eps = 25.0
-    
-    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(vortex_positions)
-    labels = clustering.labels_
-    
-    vortices = []
-    for cluster_id in set(labels):
-        if cluster_id == -1:
+
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(pts)
+
+    vortices: List[Vortex] = []
+    for cid in set(int(l) for l in labels if l != -1):
+        m = labels == cid
+        if m.sum() < min_samples:
             continue
-            
-        cluster_mask = labels == cluster_id
-        cluster_positions = vortex_positions[cluster_mask]
-        cluster_Lambda_F = vortex_Lambda_F[cluster_mask]
-        
-        center = np.mean(cluster_positions, axis=0)
-        
-        circulation = compute_circulation(
-            cluster_Lambda_F,
-            cluster_positions,
-            center
-        )
-        
-        vortices.append(Vortex(
-            center=center,
-            n_particles=len(cluster_positions),
-            circulation=circulation,
-            cluster_id=cluster_id
-        ))
-    
+        cpos = pts[m]
+        cvel = vel[m]
+        center = cpos.mean(axis=0)
+        circ = compute_circulation(cvel, cpos, center)
+        vortices.append(Vortex(center=center, n_particles=int(m.sum()), circulation=float(circ), cluster_id=cid))
     return vortices
 
-def compute_circulation(
-    Lambda_F: np.ndarray,
-    positions: np.ndarray,
-    center: np.ndarray
-) -> float:
-    """循環を計算"""
-    
-    rel_pos = positions - center
-    distances = np.linalg.norm(rel_pos, axis=1) + 1e-8
-    
-    tangent = np.stack([-rel_pos[:, 1], rel_pos[:, 0]], axis=1)
-    tangent = tangent / distances[:, None]
-    
-    v_tangential = np.sum(Lambda_F * tangent, axis=1)
-    weights = np.exp(-distances / 10.0)
-    
-    circulation = np.sum(v_tangential * weights) / np.sum(weights)
-    
-    return circulation
 
 # ==============================
-# 改良版トラッカー（シンプル）
+# シンプル・トラッカー
 # ==============================
 
 class SimpleVortexTracker:
-    """シンプルで安定したトラッカー"""
-    
     def __init__(self, matching_threshold: float = 40.0):
-        self.matching_threshold = matching_threshold
+        self.matching_threshold = float(matching_threshold)
         self.next_id = 0
-        self.tracks = {}
-        
-    def update(self, vortices: List[Vortex], step: int) -> Dict[int, int]:
-        """渦の更新"""
-        
+        self.tracks: Dict[int, List[Tuple[int, np.ndarray, float]]] = {}
+
+    def update(self, vortices: Sequence[Vortex], step: int) -> None:
         if not vortices:
-            return {}
-        
-        current_positions = np.array([v.center for v in vortices])
-        new_tracks = {}
-        used_vortices = set()
-        
-        # 既存トラックの延長
-        for track_id, track in self.tracks.items():
-            if len(track) == 0:
+            # 古いトラックの掃除
+            self.tracks = {tid: tr for tid, tr in self.tracks.items() if (step - tr[-1][0]) < 100}
+            return
+
+        cand = np.array([v.center for v in vortices])
+        used: set[int] = set()
+        new_tracks: Dict[int, List[Tuple[int, np.ndarray, float]]] = {}
+
+        # 既存トラック延長
+        for tid, tr in self.tracks.items():
+            if not tr:
                 continue
-                
-            last_step, last_pos, last_circ = track[-1]
-            
-            # 予測位置（単純に下流へ）
-            predicted_pos = last_pos + np.array([10.0 * (step - last_step) * 0.02, 0])
-            
-            min_dist = float('inf')
-            best_match = None
-            
-            for i, pos in enumerate(current_positions):
-                if i in used_vortices:
+            last_step, last_pos, _ = tr[-1]
+            # 簡易予測（下流へ）
+            pred = last_pos + np.array([10.0 * (step - last_step) * 0.02, 0.0])
+            best_i, best_d = None, np.inf
+            for i, p in enumerate(cand):
+                if i in used:
                     continue
-                
-                # x座標が大きく逆流していないか
-                if pos[0] < last_pos[0] - 20:
+                if p[0] < last_pos[0] - 20:  # 強い逆流は無視
                     continue
-                
-                dist = np.linalg.norm(pos - predicted_pos)
-                if dist < self.matching_threshold and dist < min_dist:
-                    min_dist = dist
-                    best_match = i
-            
-            if best_match is not None:
-                new_tracks[track_id] = track + [(
-                    step,
-                    current_positions[best_match],
-                    vortices[best_match].circulation
-                )]
-                used_vortices.add(best_match)
-        
-        # 新規渦の追加（障害物近傍のみ）
-        for i, vortex in enumerate(vortices):
-            if i not in used_vortices:
-                # 障害物後方の適切な範囲でのみ新規生成
-                if 80 < vortex.center[0] < 160:
-                    if abs(vortex.circulation) > 1.0 and vortex.n_particles > 8:
-                        track_id = self.next_id
-                        self.next_id += 1
-                        new_tracks[track_id] = [(
-                            step,
-                            vortex.center,
-                            vortex.circulation
-                        )]
-        
-        # 古いトラックを削除
-        self.tracks = {tid: track for tid, track in new_tracks.items() 
-                      if len(track) > 0 and (step - track[-1][0]) < 100}
-        
-        return {i: tid for tid, i in enumerate(self.tracks.keys())}
+                d = np.linalg.norm(p - pred)
+                if d < self.matching_threshold and d < best_d:
+                    best_i, best_d = i, d
+            if best_i is not None:
+                v = vortices[best_i]
+                new_tracks[tid] = tr + [(step, v.center, v.circulation)]
+                used.add(best_i)
+
+        # 新規トラック（障害物背後のみ）
+        for i, v in enumerate(vortices):
+            if i in used:
+                continue
+            cx = float(getattr(self, "obstacle_cx", 100.0))
+            if cx - 20 < v.center[0] < cx + 60 and abs(v.circulation) > 1.0 and v.n_particles > 8:
+                tid = self.next_id
+                self.next_id += 1
+                new_tracks[tid] = [(step, v.center, v.circulation)]
+
+        # 古い/空トラック除去
+        self.tracks = {tid: tr for tid, tr in new_tracks.items() if tr and (step - tr[-1][0]) < 100}
+
 
 # ==============================
-# Ultimate版：揚力係数によるStrouhal数計算
+# 揚力係数（CL）
 # ==============================
 
-def compute_effective_reynolds(states, config, n_samples=100):
-    """実効Reynolds数を推定"""
-    
-    # 障害物近傍での粘性係数をサンプリング
-    sample_indices = np.linspace(1000, len(states)-1, n_samples, dtype=int)
-    
-    viscosity_samples = []
-    for idx in sample_indices:
-        state = states[idx]
-        position = state['position']
-        is_active = state['is_active']
-        
-        # 障害物近傍の粒子
-        dx = position[:, 0] - config.obstacle_center_x
-        dy = position[:, 1] - config.obstacle_center_y
-        r = np.sqrt(dx**2 + dy**2)
-        near_obstacle = (r > config.obstacle_size) & (r < config.obstacle_size * 1.5) & is_active
-        
-        if np.sum(near_obstacle) > 0:
-            # 局所的な実効粘性（簡易推定）
-            effective_visc = config.viscosity_factor * 0.05
-            viscosity_samples.append(effective_visc)
-    
-    if viscosity_samples:
-        nu_eff = np.mean(viscosity_samples)
-        D = 2 * config.obstacle_size
-        Re_eff = config.Lambda_F_inlet * D / nu_eff
-        return Re_eff, nu_eff
-    else:
-        return 200.0, config.viscosity_factor * 0.05  # デフォルト
-
-def estimate_Ueff(states, config, x_probe=None, n_samples=64):
-    """実効流速U_effを推定（上流プローブ）- 修正版"""
-    if x_probe is None:
-        # 障害物の3D上流（5Dは遠すぎるかも）
-        x_probe = config.obstacle_center_x - 3.0 * config.obstacle_size
-    
-    # プローブ位置がドメイン内か確認
-    x_probe = max(20.0, x_probe)
-    
-    vals = []
-    # サンプリングを適度に制限（全ステップは重い）
-    sample_steps = states[1000:min(3000, len(states))]
-    
-    for st in sample_steps:
-        pos = st['position'] if isinstance(st, dict) else st.position
-        vel = st['Lambda_F'] if isinstance(st, dict) else st.Lambda_F
-        act = st['is_active'] if isinstance(st, dict) else st.is_active
-        
-        # x_probe付近の薄帯での流速
-        mask = act & (np.abs(pos[:,0] - x_probe) < 3.0)  # 幅を少し広げる
-        
-        if np.sum(mask) > 5:  # 最小粒子数チェック
-            u_vals = vel[mask, 0]
-            # 逆流を除外（負の速度は無視）
-            u_positive = u_vals[u_vals > 0]
-            if len(u_positive) > 0:
-                vals.append(np.mean(u_positive))
-    
-    if vals:
-        U_eff = float(np.median(vals))  # 中央値の方がロバスト
-        # 物理的に妥当な範囲にクリップ
-        U_eff = np.clip(U_eff, 
-                       config.Lambda_F_inlet * 0.7,
-                       config.Lambda_F_inlet * 1.0)
-    else:
-        U_eff = config.Lambda_F_inlet * 0.9
-    
-    return U_eff
-
-def lift_coefficient_ring_binned(state, config, n_bins=64):
-    """等角ビンCL計算（粒子バイアス除去）"""
+def lift_coefficient_ring_binned(state, config, n_bins: int = 64) -> float:
     pos = state['position'] if isinstance(state, dict) else state.position
     vel = state['Lambda_F'] if isinstance(state, dict) else state.Lambda_F
     act = state['is_active'] if isinstance(state, dict) else state.is_active
 
-    dx = pos[:,0] - config.obstacle_center_x
-    dy = pos[:,1] - config.obstacle_center_y
-    r = np.sqrt(dx*dx + dy*dy)
+    dx = pos[:, 0] - float(getattr(config, 'obstacle_center_x', 100.0))
+    dy = pos[:, 1] - float(getattr(config, 'obstacle_center_y', 75.0))
+    r = np.sqrt(dx * dx + dy * dy)
     theta = np.arctan2(dy, dx)
 
-    # より薄いリング（1.0-1.3倍）
-    ring = (r > config.obstacle_size*1.00) & (r < config.obstacle_size*1.30) & act
+    R = float(getattr(config, 'obstacle_size', 20.0))
+    ring = (r > R * 1.00) & (r < R * 1.30) & act
     if np.sum(ring) < 32:
         return 0.0
 
+    U_in = float(getattr(config, 'Lambda_F_inlet', 1.0))
     vel_mag = np.linalg.norm(vel[ring], axis=1)
-    Cp = 1.0 - (vel_mag / config.Lambda_F_inlet)**2
+    Cp = 1.0 - (vel_mag / U_in) ** 2
 
     th = theta[ring]
-    bins = np.linspace(-np.pi, np.pi, n_bins+1)
+    bins = np.linspace(-np.pi, np.pi, n_bins + 1)
     idx = np.digitize(th, bins) - 1
-    
-    CL_up = []
-    CL_lo = []
 
+    up, lo = [], []
     for k in range(n_bins):
-        m = (idx == k)
+        m = idx == k
         if not np.any(m):
             continue
-        
-        thk = th[m]
-        Cpk = Cp[m]
-        rep = np.median(Cpk)    # 代表値（中央値）
-        thm = np.median(thk)     # ビン中心角度
+        thm = np.median(th[m])
+        rep = np.median(Cp[m])
         term = rep * np.sin(thm)
-        
-        if thm > 0:
-            CL_up.append(term)
-        else:
-            CL_lo.append(term)
+        (up if thm > 0 else lo).append(term)
 
-    up = np.mean(CL_up) if CL_up else 0.0
-    lo = np.mean(CL_lo) if CL_lo else 0.0
-    return (up - lo) * 2.0
+    up_m = np.mean(up) if up else 0.0
+    lo_m = np.mean(lo) if lo else 0.0
+    return float((up_m - lo_m) * 2.0)
 
-def compute_lift_coefficient_ultimate(state, config, method='binned'):
-    """Ultimate版：揚力係数（等角ビンor重み付き）"""
-    
+
+def compute_lift_coefficient(state, config, method: str = 'binned') -> float:
     if method == 'binned':
         return lift_coefficient_ring_binned(state, config)
-    else:
-        # 従来の重み付き版（フォールバック）
-        # stateが辞書の場合の処理
-        if isinstance(state, dict):
-            position = state['position']
-            Lambda_F = state['Lambda_F']
-            is_active = state['is_active']
-        else:
-            position = state.position
-            Lambda_F = state.Lambda_F
-            is_active = state.is_active
-        
-        # 障害物表面近傍の粒子を選択
-        dx = position[:, 0] - config.obstacle_center_x
-        dy = position[:, 1] - config.obstacle_center_y
-        r = np.sqrt(dx**2 + dy**2)
-        
-        # 表面近傍（1.0-2.0倍の半径）
-        near_surface = (r > config.obstacle_size) & (r < config.obstacle_size * 2.0) & is_active
-        
-        if np.sum(near_surface) < 10:
-            return 0.0
-        
-        # 極座標での角度
-        theta = np.arctan2(dy[near_surface], dx[near_surface])
-        r_near = r[near_surface]
-        
-        # 速度の大きさから圧力係数を計算（ベルヌーイの定理）
-        velocity_mag = np.linalg.norm(Lambda_F[near_surface], axis=1)
-        Cp = 1.0 - (velocity_mag / config.Lambda_F_inlet)**2
-        
-        # 幾何重み（半径方向の線素）
-        w = r_near / np.mean(r_near)  # 正規化された半径重み
-        
-        # 上半分と下半分で別々に積分
-        upper_mask = theta > 0
-        lower_mask = theta <= 0
-        
-        # 各領域での重み付き圧力積分
-        if np.any(upper_mask):
-            upper_contribution = np.average(
-                Cp[upper_mask] * np.sin(theta[upper_mask]), 
-                weights=w[upper_mask]
-            )
-        else:
-            upper_contribution = 0.0
-            
-        if np.any(lower_mask):
-            lower_contribution = np.average(
-                Cp[lower_mask] * np.sin(theta[lower_mask]), 
-                weights=w[lower_mask]
-            )
-        else:
-            lower_contribution = 0.0
-        
-        # 揚力係数（上下の圧力差）
-        CL = (upper_contribution - lower_contribution) * 2.0
-        
-        return CL
+    # 追加メソッドは必要に応じて
+    return lift_coefficient_ring_binned(state, config)
 
-def refine_peak(freqs, power):
-    """ピークの放物線補間"""
-    k = np.argmax(power)
-    if 0 < k < len(power)-1:
-        y1, y2, y3 = power[k-1], power[k], power[k+1]
-        denom = (y1 - 2*y2 + y3)
-        if denom != 0:
-            delta = 0.5*(y1 - y3)/denom
-            return k + np.clip(delta, -0.5, 0.5)
-    return float(k)
 
-def estimate_f0_autocorr(sig, dt):
-    """自己相関によるピーク周波数初期推定"""
-    sig = sig - np.mean(sig)
-    ac = np.correlate(sig, sig, mode='full')[len(sig)-1:]
-    ac = ac / np.max(ac)
-    
-    # 最初の谷の後の最初の山を探す
-    from scipy.signal import find_peaks
-    peaks, _ = find_peaks(ac, distance=int(0.1/dt))
-    
-    if len(peaks) > 1:
-        T = peaks[1] * dt
-        return 1.0/T
-    return None
+# ==============================
+# U_eff / Re_eff 推定
+# ==============================
 
-def compute_strouhal_ultimate(states, config, debug=True, method='rfft'):
-    """Ultimate版：物理単位で正しく計算するStrouhal数解析
-    
-    Args:
-        states: シミュレーション状態のリスト
-        config: シミュレーション設定
-        debug: デバッグプロット出力フラグ
-        method: FFT手法 ('rfft' or 'welch')
-    
-    Returns:
-        float: 計算されたStrouhal数
-    """
-    
+def estimate_Ueff(states: Sequence, config, x_probe: Optional[float] = None) -> float:
+    cx = float(getattr(config, 'obstacle_center_x', 100.0))
+    R = float(getattr(config, 'obstacle_size', 20.0))
+    if x_probe is None:
+        x_probe = cx - 3.0 * R
+    x_probe = float(max(20.0, x_probe))
+
+    vals = []
+    s0, s1 = 1000, min(3000, len(states))
+    for st in states[s0:s1]:
+        pos = st['position'] if isinstance(st, dict) else st.position
+        vel = st['Lambda_F'] if isinstance(st, dict) else st.Lambda_F
+        act = st['is_active'] if isinstance(st, dict) else st.is_active
+        m = act & (np.abs(pos[:, 0] - x_probe) < 3.0)
+        if np.sum(m) > 5:
+            u = vel[m, 0]
+            u_pos = u[u > 0]
+            if len(u_pos) > 0:
+                vals.append(np.mean(u_pos))
+
+    U_in = float(getattr(config, 'Lambda_F_inlet', 1.0))
+    if vals:
+        med = float(np.median(vals))
+        return float(np.clip(med, 0.7 * U_in, 1.0 * U_in))
+    return 0.9 * U_in
+
+
+def compute_effective_reynolds(states: Sequence, config, n_samples: int = 100) -> Tuple[float, float]:
+    # 簡易モデル：近傍から一定の有効粘性を仮定
+    nu_eff = float(getattr(config, 'viscosity_factor', 1.0) * 0.05)
+    D = 2.0 * float(getattr(config, 'obstacle_size', 20.0))
+    U = float(getattr(config, 'Lambda_F_inlet', 1.0))
+    Re = U * D / max(nu_eff, 1e-9)
+    return float(Re), float(nu_eff)
+
+
+# ==============================
+# Strouhal 解析（物理単位）
+# ==============================
+
+def compute_strouhal(
+    states: Sequence,
+    config,
+    *,
+    debug: bool = True,
+    method: str = 'rfft',
+) -> float:
     print("\n📊 Computing lift coefficient time series...")
-    
-    # === 物理スケール変換の初期化 ===
-    if hasattr(config, 'scale_m_per_unit'):
-        L_scale = config.scale_m_per_unit
-        T_scale = config.scale_s_per_step if hasattr(config, 'scale_s_per_step') else 1.0
-    else:
-        # フォールバック（旧バージョン互換性のため）
-        L_scale = 0.001  # デフォルト: 1 grid unit = 1mm
-        T_scale = 0.01   # デフォルト: 1 step = 0.01s
-        print(f"⚠ Using default scales: L={L_scale}m/unit, T={T_scale}s/step")
-    
-    # 物理量への変換
-    D_physical = 2 * config.obstacle_size * L_scale  # [m]
-    dt_physical = config.dt * T_scale               # [s]
-    
-    print(f"\n📏 Physical scales:")
-    print(f"  Length scale (m/unit): {L_scale:.6f}")
-    print(f"  Time scale (s/step): {T_scale:.6f}")
-    print(f"  Obstacle diameter: {D_physical:.4f} m ({D_physical*1000:.1f} mm)")
-    print(f"  Time step: {dt_physical:.4f} s")
-    
-    # === CLの時系列を計算（等角ビン版） ===
-    CL_history = []
-    for i, state in enumerate(states):
-        if i % 500 == 0:
-            print(f"  Processing step {i}/{len(states)}")
-        CL = compute_lift_coefficient_ultimate(state, config, method='binned')
-        CL_history.append(CL)
-    
-    # 初期の過渡応答を除去
-    CL_signal = np.array(CL_history[1000:])  # 最初の1000ステップを除外
-    
-    if len(CL_signal) < 500:
-        print("Warning: Not enough data for accurate FFT")
+
+    L_scale, T_scale = _safe_get_scales(config)
+    D_phys = 2.0 * float(getattr(config, 'obstacle_size', 20.0)) * L_scale
+    dt_phys = float(getattr(config, 'dt', 0.01)) * T_scale
+
+    # CL 時系列
+    CL = [compute_lift_coefficient(st, config, 'binned') for st in states]
+    CL = np.asarray(CL, float)
+    CL = CL[1000:]  # 初期過渡を除去
+    if len(CL) < 500:
+        print("Warning: Not enough samples after transient removal.")
         return 0.0
-    
-    # 物理時間軸 [s]
-    time_physical = np.arange(len(CL_signal)) * dt_physical
-    
-    # トレンド除去
-    CL_signal = CL_signal - np.mean(CL_signal)
-    
-    # === U_effの推定（物理単位変換付き） ===
+
+    t_phys = np.arange(len(CL)) * dt_phys
+    CL -= CL.mean()
+
+    # U_eff
     print("\n  Estimating effective velocity U_eff...")
-    U_eff_grid = estimate_Ueff(states, config)  # グリッド単位 [unit/step]
-    U_eff_physical = U_eff_grid * L_scale / T_scale  # 物理単位 [m/s]
-    U_inlet_physical = config.Lambda_F_inlet * L_scale / T_scale  # 入口速度 [m/s]
-    
+    U_eff_grid = estimate_Ueff(states, config)
+    U_eff_phys = U_eff_grid * L_scale / T_scale
+    U_inlet_phys = float(getattr(config, 'Lambda_F_inlet', 1.0)) * L_scale / T_scale
     print(f"  U_eff (grid): {U_eff_grid:.3f} unit/step")
-    print(f"  U_eff (physical): {U_eff_physical:.3f} m/s")
-    print(f"  U_inlet (physical): {U_inlet_physical:.3f} m/s")
-    print(f"  Velocity reduction: {(1-U_eff_physical/U_inlet_physical)*100:.1f}%")
-    
-    # === 自己相関による初期周波数推定 ===
-    f0 = estimate_f0_autocorr(CL_signal, dt_physical)
-    if f0 is None:
-        # ラフな初期推定（St≈0.2の仮定）
-        f0 = 0.2 * U_eff_physical / D_physical
+    print(f"  U_eff (physical): {U_eff_phys:.3f} m/s")
+    print(f"  U_inlet (physical): {U_inlet_phys:.3f} m/s")
+
+    # 初期周波数推定（自己相関）
+    sig = CL.copy()
+    ac = np.correlate(sig - sig.mean(), sig - sig.mean(), mode='full')[len(sig) - 1:]
+    ac /= ac.max() if ac.max() > 0 else 1.0
+    peaks, _ = find_peaks(ac, distance=max(1, int(0.1 / max(dt_phys, 1e-6))))
+    if len(peaks) > 1:
+        f0 = 1.0 / (peaks[1] * dt_phys)
+    else:
+        f0 = 0.2 * U_eff_phys / max(D_phys, 1e-9)
     print(f"  Initial frequency estimate: {f0:.4f} Hz")
-    
-    # === FFT解析 ===
+
+    # スペクトル
     if method == 'rfft':
-        # rFFT法（高速）
-        window = np.hanning(len(CL_signal))
-        CL_windowed = CL_signal * window
-        
-        # ゼロパディング（FFT精度向上）
-        n_padded = 2**int(np.ceil(np.log2(len(CL_windowed) * 4)))
-        
-        # 実数FFT
-        fft = np.fft.rfft(CL_windowed, n=n_padded)
-        freqs = np.fft.rfftfreq(n_padded, d=dt_physical)  # 物理周波数 [Hz]
-        power = np.abs(fft)**2
-        
+        win = np.hanning(len(CL))
+        xw = CL * win
+        n_pad = 1 << int(np.ceil(np.log2(len(xw) * 4)))
+        spec = np.fft.rfft(xw, n=n_pad)
+        freqs = np.fft.rfftfreq(n_pad, d=dt_phys)
+        power = np.abs(spec) ** 2
     elif method == 'welch':
-        # Welch法（ノイズに強い）
-        nperseg = min(4096, len(CL_signal))
-        freqs, power = welch(CL_signal, 
-                           fs=1.0/dt_physical,  # サンプリング周波数 [Hz]
-                           window='hann',
-                           nperseg=nperseg,
-                           noverlap=nperseg//2)
+        nperseg = min(4096, len(CL))
+        freqs, power = welch(CL, fs=1.0 / dt_phys, window='hann', nperseg=nperseg, noverlap=nperseg // 2)
     else:
         raise ValueError(f"Unknown method: {method}")
-    
-    # === 狭窓でのピーク探索 ===
-    fmin, fmax = 0.7*f0, 1.3*f0
-    valid_range = (freqs > fmin) & (freqs < fmax)
-    
-    if np.any(valid_range):
-        valid_freqs = freqs[valid_range]
-        valid_power = power[valid_range]
-        
-        # 放物線補間でサブビン精度
-        kref = refine_peak(valid_freqs, valid_power)
-        peak_freq = np.interp(kref, np.arange(len(valid_freqs)), valid_freqs)
-        
-        # === Strouhal数の計算（物理単位） ===
-        St = peak_freq * D_physical / U_eff_physical
-        
-        # === Reynolds数の計算（物理単位） ===
-        nu_air = 1.5e-5  # 空気の動粘性係数 [m²/s] @ 20°C
-        Re_physical = U_eff_physical * D_physical / nu_air
-        
-        # 実効Reynolds数の推定（オプション）
-        Re_eff, nu_eff = compute_effective_reynolds(states, config)
-        
-        if debug:
-            print(f"\n✨ Ultimate Physical Analysis:")
-            print(f"  === Frequency Analysis ===")
-            print(f"  Peak frequency: {peak_freq:.4f} Hz")
-            print(f"  Expected freq (St=0.195): {0.195*U_eff_physical/D_physical:.4f} Hz")
-            print(f"  === Physical Parameters ===")
-            print(f"  D (physical): {D_physical:.4f} m ({D_physical*1000:.1f} mm)")
-            print(f"  U_eff (physical): {U_eff_physical:.3f} m/s")
-            print(f"  Reynolds (physical): {Re_physical:.0f}")
-            print(f"  === Strouhal Number ===")
-            print(f"  Computed St: {St:.4f}")
-            print(f"  Target St (Re=200): 0.195")
-            print(f"  Error: {abs(St - 0.195)/0.195*100:.1f}%")
-            
-            # ブロッケージ比の確認
-            domain_height_physical = config.domain_height * L_scale
-            blockage = D_physical / domain_height_physical
-            print(f"  === Flow Conditions ===")
-            print(f"  Blockage ratio: {blockage:.3f}")
-            if blockage > 0.2:
-                print(f"  ⚠ High blockage may affect St by ~{(blockage-0.2)*10:.1f}%")
-            
-            # === 詳細なプロット ===
-            fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-            
-            # 1. 元の時系列（物理時間軸）
-            ax = axes[0, 0]
-            time_full_physical = np.arange(len(CL_history)) * dt_physical
-            ax.plot(time_full_physical, CL_history, linewidth=0.5)
-            ax.set_xlabel('Time [s]')
-            ax.set_ylabel('CL')
-            ax.set_title('Raw Lift Coefficient Time Series')
-            ax.grid(True, alpha=0.3)
-            
-            # 2. 処理後の信号
-            ax = axes[0, 1]
-            ax.plot(time_physical, CL_signal, linewidth=0.5)
-            ax.set_xlabel('Time [s]')
-            ax.set_ylabel('CL (detrended)')
-            ax.set_title('Processed Signal (after removing initial transient)')
-            ax.grid(True, alpha=0.3)
-            
-            # 3. パワースペクトル（線形スケール）
-            ax = axes[0, 2]
-            mask = freqs < 2.0  # 2Hz以下を表示
-            ax.plot(freqs[mask], power[mask])
-            ax.axvline(peak_freq, color='red', linestyle='--', 
-                      label=f'Peak: {peak_freq:.4f} Hz')
-            ax.axvspan(fmin, fmax, alpha=0.2, color='yellow', label='Search window')
-            ax.set_xlabel('Frequency [Hz]')
-            ax.set_ylabel('Power')
-            ax.set_title(f'Power Spectrum ({method.upper()})')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # 4. パワースペクトル（対数スケール）
-            ax = axes[1, 0]
-            ax.semilogy(freqs[mask], power[mask])
-            ax.axvline(peak_freq, color='red', linestyle='--', 
-                      label=f'Peak: {peak_freq:.4f} Hz')
-            expected_f = 0.195 * U_eff_physical / D_physical
-            ax.axvline(expected_f, color='green', linestyle=':', 
-                      label=f'Expected (St=0.195): {expected_f:.4f} Hz')
-            ax.set_xlabel('Frequency [Hz]')
-            ax.set_ylabel('Power (log scale)')
-            ax.set_title('Power Spectrum (Log Scale)')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # 5. Strouhal vs Reynolds
-            ax = axes[1, 1]
-            Re_range = np.array([100, 150, 200, 250, 300])
-            St_empirical = 0.195 * np.ones_like(Re_range)
-            ax.plot(Re_range, St_empirical, 'g-', label='Empirical (cylinder)')
-            ax.scatter([Re_physical], [St], color='red', s=100, 
-                      zorder=5, label=f'Simulation (Re={Re_physical:.0f})')
-            ax.set_xlabel('Reynolds Number')
-            ax.set_ylabel('Strouhal Number')
-            ax.set_title('St vs Re Comparison')
-            ax.set_xlim(50, 350)
-            ax.set_ylim(0.1, 0.3)
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # 6. 物理パラメータサマリー
-            ax = axes[1, 2]
-            summary_text = "=== PHYSICAL PARAMETERS ===\n"
-            summary_text += f"Length scale: {L_scale*1000:.3f} mm/unit\n"
-            summary_text += f"Time scale: {T_scale*1000:.1f} ms/step\n"
-            summary_text += f"─────────────────\n"
-            summary_text += f"Cylinder diameter: {D_physical*1000:.1f} mm\n"
-            summary_text += f"Domain height: {domain_height_physical*1000:.0f} mm\n"
-            summary_text += f"Blockage: {blockage:.1%}\n"
-            summary_text += f"─────────────────\n"
-            summary_text += f"U_eff: {U_eff_physical:.3f} m/s\n"
-            summary_text += f"U_inlet: {U_inlet_physical:.3f} m/s\n"
-            summary_text += f"Reynolds: {Re_physical:.0f}\n"
-            summary_text += f"─────────────────\n"
-            summary_text += f"Shedding freq: {peak_freq:.3f} Hz\n"
-            summary_text += f"Shedding period: {1/peak_freq:.3f} s\n"
-            summary_text += f"Strouhal: {St:.4f}\n"
-            summary_text += f"Error from 0.195: {(St-0.195)/0.195*100:+.1f}%"
-            
-            ax.text(0.1, 0.5, summary_text, transform=ax.transAxes,
-                   fontsize=10, verticalalignment='center', family='monospace',
-                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-            ax.axis('off')
-            ax.set_title('Physical Analysis Summary')
-            
-            plt.suptitle(f'GET Wind™ Strouhal Analysis (Physical Units)', fontsize=14, y=1.02)
-            plt.tight_layout()
-            plt.savefig('strouhal_analysis_physical.png', dpi=150, bbox_inches='tight')
-            print(f"\n  📊 Plot saved to 'strouhal_analysis_physical.png'")
-        
-        return St
-        
-    else:
-        print(f"Warning: No valid peak found in range [{fmin:.4f}, {fmax:.4f}] Hz")
+
+    # ピーク探索（狭窓）
+    fmin, fmax = 0.7 * f0, 1.3 * f0
+    vr = (freqs > fmin) & (freqs < fmax)
+    if not np.any(vr):
+        print(f"Warning: No valid peak in [{fmin:.3f},{fmax:.3f}] Hz")
         return 0.0
 
+    vf, vp = freqs[vr], power[vr]
+    kref = _parabolic_peak_index(vp)
+    peak_freq = float(np.interp(kref, np.arange(len(vf)), vf))
+
+    # Strouhal
+    St = peak_freq * D_phys / max(U_eff_phys, 1e-9)
+
+    # 物理パラメータも出力
+    nu_air = 1.5e-5
+    Re_phys = U_eff_phys * D_phys / nu_air
+
+    if debug:
+        print("\n✨ Ultimate Physical Analysis:")
+        print("  === Frequency Analysis ===")
+        print(f"  Peak frequency: {peak_freq:.4f} Hz")
+        print(f"  Expected freq (St=0.195): {0.195 * U_eff_phys / D_phys:.4f} Hz")
+        print("  === Physical Parameters ===")
+        print(f"  D (physical): {D_phys:.4f} m")
+        print(f"  U_eff (physical): {U_eff_phys:.3f} m/s")
+        print(f"  Reynolds (physical): {Re_phys:.0f}")
+        print("  === Strouhal Number ===")
+        print(f"  Computed St: {St:.4f}")
+        print("  Target St (Re=200): 0.195")
+        print(f"  Error: {abs(St - 0.195) / 0.195 * 100:.1f}%")
+
+        # プロット
+        fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+        # 1. 元系列
+        t_full = np.arange(len(states)) * dt_phys
+        axes[0, 0].plot(t_full, [compute_lift_coefficient(s, config, 'binned') for s in states], lw=0.5)
+        axes[0, 0].set_title('Raw CL')
+        axes[0, 0].set_xlabel('Time [s]')
+        axes[0, 0].set_ylabel('CL')
+        axes[0, 0].grid(alpha=0.3)
+        # 2. 処理後
+        axes[0, 1].plot(t_phys, CL, lw=0.6)
+        axes[0, 1].set_title('CL (detrended, transient removed)')
+        axes[0, 1].set_xlabel('Time [s]')
+        axes[0, 1].set_ylabel('CL')
+        axes[0, 1].grid(alpha=0.3)
+        # 3. スペクトル（線形）
+        m = freqs < 2.0
+        axes[0, 2].plot(freqs[m], power[m])
+        axes[0, 2].axvline(peak_freq, ls='--', c='r', label=f'Peak {peak_freq:.3f} Hz')
+        axes[0, 2].axvspan(fmin, fmax, alpha=0.2, color='yellow')
+        axes[0, 2].legend(); axes[0, 2].grid(alpha=0.3)
+        axes[0, 2].set_title(f'Power Spectrum ({method.upper()})')
+        # 4. スペクトル（対数）
+        axes[1, 0].semilogy(freqs[m], power[m])
+        axes[1, 0].axvline(peak_freq, ls='--', c='r')
+        axes[1, 0].axvline(0.195 * U_eff_phys / D_phys, ls=':', c='g')
+        axes[1, 0].grid(alpha=0.3)
+        axes[1, 0].set_title('Power (log)')
+        # 5. St vs Re（簡易）
+        Re_range = np.array([100, 150, 200, 250, 300])
+        St_emp = 0.195 * np.ones_like(Re_range)
+        axes[1, 1].plot(Re_range, St_emp, 'g-', label='Empirical (cyl)')
+        axes[1, 1].scatter([Re_phys], [St], c='r', s=80, zorder=5, label=f'Sim (Re={Re_phys:.0f})')
+        axes[1, 1].set_xlim(50, 350); axes[1, 1].set_ylim(0.1, 0.3)
+        axes[1, 1].legend(); axes[1, 1].grid(alpha=0.3)
+        axes[1, 1].set_title('St vs Re')
+        # 6. サマリー
+        domain_h_phys = float(getattr(config, 'domain_height', 150.0)) * L_scale
+        blockage = D_phys / max(domain_h_phys, 1e-9)
+        txt = (
+            f"=== PHYSICAL PARAMETERS ===\n"
+            f"Length scale: {L_scale*1000:.3f} mm/unit\n"
+            f"Time scale: {T_scale*1000:.1f} ms/step\n"
+            f"─────────────────\n"
+            f"Cylinder diameter: {D_phys*1000:.1f} mm\n"
+            f"Domain height: {domain_h_phys*1000:.0f} mm\n"
+            f"Blockage: {blockage:.1%}\n"
+            f"─────────────────\n"
+            f"U_eff: {U_eff_phys:.3f} m/s\n"
+            f"U_inlet: {U_inlet_phys:.3f} m/s\n"
+            f"Reynolds: {Re_phys:.0f}\n"
+            f"─────────────────\n"
+            f"Shedding freq: {peak_freq:.3f} Hz\n"
+            f"Shedding period: {1/peak_freq:.3f} s\n"
+            f"Strouhal: {St:.4f}\n"
+            f"Error from 0.195: {(St-0.195)/0.195*100:+.1f}%"
+        )
+        axes[1, 2].text(0.1, 0.5, txt, transform=axes[1, 2].transAxes,
+                        fontsize=10, va='center', family='monospace',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        axes[1, 2].axis('off'); axes[1, 2].set_title('Summary')
+        plt.tight_layout()
+        plt.savefig('strouhal_analysis_physical.png', dpi=150, bbox_inches='tight')
+        print("  📊 Plot saved to 'strouhal_analysis_physical.png'")
+
+    return float(St)
+
+
 # ==============================
-# きれいな軌跡描画
+# 可視化: きれいな軌跡
 # ==============================
 
-def plot_clean_vortex_trajectories(tracker, figsize=(14, 7)):
-    """きれいなカルマン渦の軌跡を描画"""
-    
+def plot_clean_vortex_trajectories(tracker: SimpleVortexTracker, figsize=(14, 7)) -> plt.Figure:
     fig, ax = plt.subplots(figsize=figsize)
-    
-    # 有効な軌跡をフィルタリング
-    valid_tracks = []
-    for track_id, track in tracker.tracks.items():
-        if len(track) < 10:  # 10ステップ以上続いた渦のみ
+
+    valid = []
+    for tid, tr in tracker.tracks.items():
+        if len(tr) < 10:
             continue
-            
-        positions = np.array([t[1] for t in track])
-        circulations = np.array([t[2] for t in track])
-        
-        # x座標が単調増加しているかチェック
-        x_coords = positions[:, 0]
-        for i in range(1, len(x_coords)):
-            if x_coords[i] < x_coords[i-1] - 15:  # 15単位以上の逆流は異常
-                positions = positions[:i]  # 逆流前までで切る
+        P = np.array([p for (_, p, _) in tr])
+        C = np.array([c for (*_, c) in tr])
+        # 逆流カット
+        x = P[:, 0]
+        for i in range(1, len(x)):
+            if x[i] < x[i - 1] - 15:
+                P = P[:i]
+                C = C[:i]
                 break
-        
-        if len(positions) < 20:
+        if len(P) < 20:
             continue
-            
-        # 総移動距離チェック
-        total_dist = np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1))
-        if total_dist < 20 or total_dist > 800:
+        dist = np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1))
+        if dist < 20 or dist > 800:
             continue
-            
-        # 平均循環強度
-        mean_circ = np.mean(np.abs(circulations))
-        if mean_circ < 0.3:
+        if np.mean(np.abs(C)) < 0.3:
             continue
-            
-        valid_tracks.append((track_id, positions, mean_circ))
-    
-    # 軌跡を描画
-    for idx, (track_id, positions, mean_circ) in enumerate(valid_tracks):
-        # スムージング（オプション）
-        if len(positions) > 5:
-            positions[:, 0] = gaussian_filter1d(positions[:, 0], sigma=1.5)
-            positions[:, 1] = gaussian_filter1d(positions[:, 1], sigma=1.5)
-        
-        # 色分け（初期y位置で判定）
-        if positions[0, 1] > 75:
-            color = 'red'
-            label = 'Upper vortex' if idx == 0 else None
-        else:
-            color = 'blue'
-            label = 'Lower vortex' if idx == 1 else None
-        
-        # 軌跡を描画
-        ax.plot(positions[:, 0], positions[:, 1],
-                color=color, alpha=0.6, linewidth=2,
-                label=label)
-        
-        # 始点と終点をマーク
-        ax.scatter(positions[0, 0], positions[0, 1], 
-                  color=color, s=50, marker='o', zorder=5)
-        ax.scatter(positions[-1, 0], positions[-1, 1], 
-                  color=color, s=50, marker='s', zorder=5)
-    
-    # 理想的なカルマン渦の軌跡（参考）
+        valid.append((tid, P, np.mean(np.abs(C))))
+
+    for idx, (tid, P, mc) in enumerate(valid):
+        if len(P) > 5:
+            P[:, 0] = gaussian_filter1d(P[:, 0], sigma=1.5)
+            P[:, 1] = gaussian_filter1d(P[:, 1], sigma=1.5)
+        color = 'red' if P[0, 1] > 75 else 'blue'
+        label = 'Upper vortex' if (color == 'red' and idx == 0) else ('Lower vortex' if (color == 'blue' and idx == 0) else None)
+        ax.plot(P[:, 0], P[:, 1], color=color, alpha=0.6, lw=2, label=label)
+        ax.scatter(P[0, 0], P[0, 1], color=color, s=50, marker='o', zorder=5)
+        ax.scatter(P[-1, 0], P[-1, 1], color=color, s=50, marker='s', zorder=5)
+
+    # 参考の理想軌跡
     t = np.linspace(0, 150, 100)
-    x_ideal = 100 + t
-    y_upper_ideal = 75 + 25 * np.sin(2 * np.pi * t / 50) * np.exp(-t / 200)
-    y_lower_ideal = 75 - 25 * np.sin(2 * np.pi * t / 50 + np.pi) * np.exp(-t / 200)
-    
-    ax.plot(x_ideal, y_upper_ideal, 'r--', alpha=0.2, linewidth=1, label='Ideal upper')
-    ax.plot(x_ideal, y_lower_ideal, 'b--', alpha=0.2, linewidth=1, label='Ideal lower')
-    
-    # 障害物
-    circle = plt.Circle((100, 75), 20, fill=False, color='black', linewidth=2)
+    x0 = 100 + t
+    y_up = 75 + 25 * np.sin(2 * np.pi * t / 50) * np.exp(-t / 200)
+    y_lo = 75 - 25 * np.sin(2 * np.pi * t / 50 + np.pi) * np.exp(-t / 200)
+    ax.plot(x0, y_up, 'r--', alpha=0.2, lw=1, label='Ideal upper')
+    ax.plot(x0, y_lo, 'b--', alpha=0.2, lw=1, label='Ideal lower')
+
+    # 障害物（円）
+    circle = plt.Circle((100, 75), 20, fill=True, color='gray', alpha=0.25, ec='k')
     ax.add_patch(circle)
-    ax.add_patch(plt.Circle((100, 75), 20, fill=True, color='gray', alpha=0.3))
-    
-    # グリッドとラベル
-    ax.set_xlim(0, 300)
-    ax.set_ylim(0, 150)
-    ax.set_aspect('equal')
+
+    ax.set_xlim(0, 300); ax.set_ylim(0, 150); ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    ax.set_xlabel('X position')
-    ax.set_ylabel('Y position')
+    ax.set_xlabel('X position'); ax.set_ylabel('Y position')
     ax.set_title('Clean Vortex Trajectories (Karman Vortex Street)')
     ax.legend(loc='upper right')
-    
-    # 流れ方向の矢印
-    ax.arrow(10, 140, 30, 0, head_width=3, head_length=5, 
-            fc='gray', ec='gray', alpha=0.5)
-    ax.text(25, 145, 'Flow', ha='center', fontsize=10, color='gray')
-    
     plt.tight_layout()
     return fig
 
+
 # ==============================
-# メイン処理（Ultimate版）
+# メイン処理
 # ==============================
 
 def process_simulation_results(
-    simulation_file: str = 'simulation_results_v63_cylinder.npz',  # v6.3対応！
+    simulation_file: str = 'simulation_results_v63_cylinder.npz',
+    *,
     debug: bool = True,
-    fft_method: str = 'rfft'  # 'rfft' or 'welch'
-):
-    """シミュレーション結果を処理してStrouhal数を計算"""
-    
+    fft_method: str = 'rfft',
+) -> float:
     print("=" * 70)
-    print("GET Wind™ Vortex Analysis - Ultimate Edition")
+    print("GET Wind™ Vortex Analysis — Refactored Ultimate")
     print("環ちゃん & ご主人さま Complete Fix! 💕")
     print("=" * 70)
-    
-    # データ読み込み
+
+    # ロード
     print("\n📁 Loading simulation data...")
     print(f"  File: {simulation_file}")
-    
+
+    data = None
     try:
         data = np.load(simulation_file, allow_pickle=True)
     except FileNotFoundError:
-        print(f"  ⚠ File not found: {simulation_file}")
-        # フォールバック試行
-        fallback_files = [
-            'simulation_results_v63.npz',
-            'simulation_results_v62.npz'
-        ]
-        for fallback in fallback_files:
+        for fb in ['simulation_results_v63.npz', 'simulation_results_v62.npz']:
             try:
-                print(f"  Trying fallback: {fallback}")
-                data = np.load(fallback, allow_pickle=True)
-                simulation_file = fallback
+                print(f"  Trying fallback: {fb}")
+                data = np.load(fb, allow_pickle=True)
+                simulation_file = fb
                 break
             except FileNotFoundError:
-                continue
-        else:
-            raise FileNotFoundError(f"No simulation result file found!")
-    
+                pass
+        if data is None:
+            raise FileNotFoundError('No simulation result file found!')
+
     states = data['states'].tolist() if hasattr(data['states'], 'tolist') else data['states']
-    config_dict = data['config'].item() if hasattr(data['config'], 'item') else data['config']
-    
-    # 簡易Config作成
+    cfg_raw = data['config'].item() if hasattr(data['config'], 'item') else data['config']
+
     class SimpleConfig:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
+        def __init__(self, **kw):
+            for k, v in kw.items():
                 setattr(self, k, v)
-    
-    if isinstance(config_dict, dict):
-        config = SimpleConfig(**config_dict)
-    else:
-        config = config_dict
-    
+
+    config = SimpleConfig(**cfg_raw) if isinstance(cfg_raw, dict) else cfg_raw
+
     print(f"  Loaded {len(states)} timesteps")
-    print(f"  dt = {config.dt}")
-    print(f"  Obstacle: center=({config.obstacle_center_x}, {config.obstacle_center_y}), radius={config.obstacle_size}")
-    print(f"  Inlet velocity: {config.Lambda_F_inlet}")
-    
-    # Reynolds数の確認
-    D = 2 * config.obstacle_size
-    Re_nominal = config.Lambda_F_inlet * D / (config.viscosity_factor * 0.05)
-    print(f"  Nominal Reynolds number: {Re_nominal:.1f}")
-    
-    # 揚力係数法でStrouhal数計算（Ultimate版）
-    St_lift = compute_strouhal_ultimate(states, config, debug=debug, method=fft_method)
-    
-    # DBSCANトラッキング（可視化用、自動eps）
+    print(f"  dt = {getattr(config, 'dt', None)}")
+    print(f"  Obstacle: center=({getattr(config,'obstacle_center_x',None)}, {getattr(config,'obstacle_center_y',None)}), radius={getattr(config,'obstacle_size',None)}")
+    print(f"  Inlet velocity: {getattr(config,'Lambda_F_inlet', None)}")
+
+    # 名目Re（簡易）
+    D = 2.0 * float(getattr(config, 'obstacle_size', 20.0))
+    Re_nom = float(getattr(config, 'Lambda_F_inlet', 1.0)) * D / max(float(getattr(config, 'viscosity_factor', 1.0)) * 0.05, 1e-9)
+    print(f"  Nominal Reynolds number: {Re_nom:.1f}")
+
+    # Strouhal
+    St = compute_strouhal(states, config, debug=debug, method=fft_method)
+
+    # 可視化（任意）
     if debug:
-        print("\n🔍 Processing vortex tracking for visualization...")
+        print("\n🔍 Vortex tracking for visualization (subset)...")
         tracker = SimpleVortexTracker(matching_threshold=40.0)
-        
-        for i, state in enumerate(states):
-            if i % 500 == 0:
-                print(f"  Step {i}/{len(states)}")
-            
-            # stateが辞書の場合の処理
-            if isinstance(state, dict):
-                positions = state['position']
-                Lambda_F = state['Lambda_F']
-                Q_criterion = state['Q_criterion']
-                is_active = state['is_active']
-            else:
-                positions = state.position
-                Lambda_F = state.Lambda_F
-                Q_criterion = state.Q_criterion
-                is_active = state.is_active
-            
-            vortices = detect_vortices_dbscan(
-                positions,
-                Lambda_F,
-                Q_criterion,
-                is_active,
-                eps=None,  # 自動計算
-                min_samples=8,
-                Q_threshold=0.2,
-                auto_eps=True
-            )
-            
-            # 強い渦のみ
-            strong_vortices = [v for v in vortices 
-                              if abs(v.circulation) > 1.0 and v.n_particles > 10]
-            
-            tracker.update(strong_vortices, i)
-        
-        # きれいな軌跡を描画
-        print("\n📈 Plotting clean trajectories...")
+        tracker.obstacle_cx = float(getattr(config, 'obstacle_center_x', 100.0))
+        for i, st in enumerate(states[::10]):  # 軽量化のため 1/10 サンプリング
+            pos = st['position'] if isinstance(st, dict) else st.position
+            vel = st['Lambda_F'] if isinstance(st, dict) else st.Lambda_F
+            Qc = st.get('Q_criterion', None) if isinstance(st, dict) else getattr(st, 'Q_criterion', None)
+            act = st['is_active'] if isinstance(st, dict) else st.is_active
+            if Qc is None:
+                # Q 基準が無ければ速度勾配情報が必要。なければスキップ。
+                continue
+            vort = detect_vortices_dbscan(pos, vel, Qc, act, eps=None, min_samples=8, Q_threshold=0.2, auto_eps=True)
+            strong = [v for v in vort if abs(v.circulation) > 1.0 and v.n_particles > 10]
+            tracker.update(strong, i)
         fig = plot_clean_vortex_trajectories(tracker)
         plt.savefig('clean_vortex_trajectories_ultimate.png', dpi=150)
         print("  Saved to 'clean_vortex_trajectories_ultimate.png'")
-    
-    # 最終結果
+
     print("\n" + "=" * 70)
     print("✨ FINAL RESULTS (Ultimate Analysis):")
-    print(f"  Strouhal number: {St_lift:.4f}")
-    print(f"  Target (Re=200): 0.195")
-    print(f"  Error: {abs(St_lift - 0.195)/0.195*100:.1f}%")
+    print(f"  Strouhal number: {St:.4f}")
+    print("  Target (Re=200): 0.195")
+    print(f"  Error: {abs(St - 0.195) / 0.195 * 100:.1f}%")
     print(f"  FFT Method: {fft_method.upper()}")
-    
-    if 0.18 < St_lift < 0.21:
+    if 0.18 < St < 0.21:
         print("  🎉 SUCCESS! Strouhal number is within 10% of target!")
-    elif 0.15 < St_lift < 0.25:
+    elif 0.15 < St < 0.25:
         print("  ✅ Good! Strouhal number is physically reasonable.")
     else:
         print("  ⚠️  Strouhal number needs further tuning.")
-    
     print("=" * 70)
-    
-    return St_lift
+
+    return float(St)
+
 
 # ==============================
-# 実行
+# CLI
 # ==============================
 
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='GET Wind™ Ultimate Vortex Analysis')
-    parser.add_argument('--file', type=str, 
-                       default='simulation_results_v63_cylinder.npz',
-                       help='Simulation result file')
-    parser.add_argument('--method', type=str, 
-                       choices=['rfft', 'welch'],
-                       default='rfft',
-                       help='FFT method for spectrum analysis')
-    parser.add_argument('--no-debug', action='store_true',
-                       help='Disable debug plots')
-    
-    args = parser.parse_args()
-    
-    # メイン処理を実行
-    St = process_simulation_results(
-        simulation_file=args.file,
-        debug=not args.no_debug,
-        fft_method=args.method
-    )
-    
+def main() -> None:
+    p = argparse.ArgumentParser(description='GET Wind™ Refactored Ultimate Vortex Analysis')
+    p.add_argument('--file', type=str, default='simulation_results_v63_cylinder.npz', help='Simulation result file (.npz)')
+    p.add_argument('--method', type=str, choices=['rfft', 'welch'], default='rfft', help='Spectrum estimation method')
+    p.add_argument('--no-debug', action='store_true', help='Disable debug plots')
+    args = p.parse_args()
+
+    St = process_simulation_results(simulation_file=args.file, debug=not args.no_debug, fft_method=args.method)
     print(f"\n🌀 Final Strouhal number: {St:.4f}")
     print("✨ Ultimate Analysis complete! 💕")
+
+
+if __name__ == '__main__':
+    main()
