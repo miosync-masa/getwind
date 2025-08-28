@@ -12,6 +12,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.ndimage import gaussian_filter
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import cg
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, List
 import json
@@ -26,6 +28,13 @@ try:
 except ImportError:
     HAS_DCT = False
     print("Warning: scipy.fft not available, using fallback solver")
+
+# AMGプリコンディショナー（オプション）
+try:
+    import pyamg
+    HAS_AMG = True
+except ImportError:
+    HAS_AMG = False
 
 # ==============================
 # Configuration Classes (3D Extended)
@@ -458,14 +467,129 @@ class GeometricBernoulli3D:
         
         return level_set
     
+    def _assemble_masked_poisson(self, fluid_mask, solid_mask,
+                                 solid_plus_x, solid_minus_x,
+                                 solid_plus_y, solid_minus_y,
+                                 solid_plus_z, solid_minus_z,
+                                 dx, dy, dz, Ux, Uy, Uz):
+        """疎行列版ラプラシアンの組み立て（流体セルのみ）"""
+        import numpy as np
+        from scipy.sparse import coo_matrix
+
+        nx, ny, nz = fluid_mask.shape
+        # linid: 流体セルに連番を振る
+        linid = -np.ones((nx,ny,nz), dtype=np.int64)
+        linid[fluid_mask] = np.arange(fluid_mask.sum(), dtype=np.int64)
+        N = int(fluid_mask.sum())
+
+        data = []
+        row  = []
+        col  = []
+        b    = np.zeros(N, dtype=np.float64)
+
+        cx = 1.0/dx**2
+        cy = 1.0/dy**2
+        cz = 1.0/dz**2
+        diag = 2*cx + 2*cy + 2*cz
+
+        # 1) まず全流体セルで中心の係数を置く
+        ii, jj, kk = np.nonzero(fluid_mask)
+        for (i,j,k) in zip(ii, jj, kk):
+            p = linid[i,j,k]
+            # 対角
+            row.append(p); col.append(p); data.append(diag)
+
+            # x+ 隣接
+            if i+1 < nx and fluid_mask[i+1,j,k]:
+                q = linid[i+1,j,k]
+                row.append(p); col.append(q); data.append(-cx)
+            else:
+                # Neumann: 外枠 or 固体に面している → ゴースト置換で RHS へ
+                # 外枠は g=0 → 係数修正のみ
+                # 固体面は g = -U·n, ここでは n=+ex → g = -Ux
+                if i+1 == nx or solid_mask[i+1,j,k]:
+                    g = 0.0
+                    if i+1 < nx and solid_mask[i+1,j,k]:
+                        g = -Ux
+                    b[p] += 2.0 * g / dx
+
+            # x- 隣接
+            if i-1 >= 0 and fluid_mask[i-1,j,k]:
+                q = linid[i-1,j,k]
+                row.append(p); col.append(q); data.append(-cx)
+            else:
+                if i-1 < 0 or solid_mask[i-1,j,k]:
+                    g = 0.0
+                    if i-1 >= 0 and solid_mask[i-1,j,k]:
+                        g = +Ux     # n=-ex なので g = -U·(-ex)= +Ux
+                    b[p] += 2.0 * g / dx
+
+            # y+ 隣接
+            if j+1 < ny and fluid_mask[i,j+1,k]:
+                q = linid[i,j+1,k]
+                row.append(p); col.append(q); data.append(-cy)
+            else:
+                if j+1 == ny or solid_mask[i,j+1,k]:
+                    g = 0.0
+                    if j+1 < ny and solid_mask[i,j+1,k]:
+                        g = -Uy
+                    b[p] += 2.0 * g / dy
+
+            # y- 隣接
+            if j-1 >= 0 and fluid_mask[i,j-1,k]:
+                q = linid[i,j-1,k]
+                row.append(p); col.append(q); data.append(-cy)
+            else:
+                if j-1 < 0 or solid_mask[i,j-1,k]:
+                    g = 0.0
+                    if j-1 >= 0 and solid_mask[i,j-1,k]:
+                        g = +Uy
+                    b[p] += 2.0 * g / dy
+
+            # z+ 隣接
+            if k+1 < nz and fluid_mask[i,j,k+1]:
+                q = linid[i,j,k+1]
+                row.append(p); col.append(q); data.append(-cz)
+            else:
+                if k+1 == nz or solid_mask[i,j,k+1]:
+                    g = 0.0
+                    if k+1 < nz and solid_mask[i,j,k+1]:
+                        g = -Uz
+                    b[p] += 2.0 * g / dz
+
+            # z- 隣接
+            if k-1 >= 0 and fluid_mask[i,j,k-1]:
+                q = linid[i,j,k-1]
+                row.append(p); col.append(q); data.append(-cz)
+            else:
+                if k-1 < 0 or solid_mask[i,j,k-1]:
+                    g = 0.0
+                    if k-1 >= 0 and solid_mask[i,j,k-1]:
+                        g = +Uz
+                    b[p] += 2.0 * g / dz
+
+        # 2) ゲージ固定：最初の流体セルをピン留め
+        row.append(0); col.append(0); data.append(1e6)   # 大きめ係数で固定
+        b[0] = 0.0
+
+        A = coo_matrix((data,(row,col)), shape=(N,N))
+        return A, b
+    
+    def _scatter_linear_to_3d(self, phi_lin, fluid_mask):
+        """1D配列を3Dグリッドに戻す"""
+        nx, ny, nz = fluid_mask.shape
+        phi = np.zeros((nx, ny, nz), dtype=np.float64)
+        phi[fluid_mask] = phi_lin
+        return phi
+    
     def _solve_laplace_square(self, level_set: np.ndarray, U_inf: float) -> np.ndarray:
-        """角柱まわりのラプラス方程式を解く（DCT前処理付きPCG法、迎角対応）
+        """角柱まわりのラプラス方程式を解く（疎行列版、迎角対応）
         
         φ = U·x + ϕ の変数置換で、∇²ϕ = 0 を解く
         外枠: ∂ϕ/∂n = 0 (同次Neumann)
         角柱: ∂ϕ/∂n = -U·n (非同次Neumann)
         """
-        print("      Setting up Laplace equation with ghost cells...")
+        print("      Setting up Laplace equation with sparse matrix...")
         
         nx, ny, nz = self.grid.nx, self.grid.ny, self.grid.nz
         dx, dy, dz = self.grid.dx, self.grid.dy, self.grid.dz
@@ -506,169 +630,59 @@ class GeometricBernoulli3D:
         solid_plus_y, solid_minus_y = get_solid_neighbors(solid_mask, 1)
         solid_plus_z, solid_minus_z = get_solid_neighbors(solid_mask, 2)
         
-        # === 1.5 流体投影関数（solid_maskが必要）===
-        def project_fluid(arr):
-            out = arr.copy()
-            out[solid_mask] = 0.0
-            return out
-        
-        # === 2. 右辺ベクトルbの構築（迎角対応、正しい符号）===
-        b = np.zeros((nx, ny, nz), dtype=np.float64)
-        
-        # 境界条件: ∂ϕ/∂n = g = -U·n
-        # ゴーストセル法での正しい離散化
-        # X面での寄与（両面とも同符号！）
-        if abs(Ux) > 1e-10:
-            b[solid_plus_x] += Ux / dx   # +x面
-            b[solid_minus_x] += Ux / dx  # -x面
-            
-        # Y面での寄与
-        if abs(Uy) > 1e-10:
-            b[solid_plus_y] += Uy / dy   # +y面
-            b[solid_minus_y] += Uy / dy  # -y面
-            
-        # Z面での寄与
-        if abs(Uz) > 1e-10:
-            b[solid_plus_z] += Uz / dz   # +z面
-            b[solid_minus_z] += Uz / dz  # -z面
-        
-        # === 2.5 Neumann整合性（右辺の平均ゼロ化） ===
-        b_mean = b[fluid_mask].mean()
-        if abs(b_mean) > 1e-14:
-            print(f"      Enforcing compatibility: b_mean = {b_mean:.2e}")
-            b[fluid_mask] -= b_mean
-        
-        # === 3. DCT前処理関数 ===
-        try:
-            from scipy.fft import dctn, idctn
-            use_dct = True
-            print("      Using DCT preconditioner (optimal)")
-        except ImportError:
-            use_dct = False
-            print("      scipy.fft not available, using simple Jacobi")
-        
-        def neumann_poisson_precond(r):
-            if not use_dct:
-                # 簡易Jacobi前処理
-                return r / (2/dx**2 + 2/dy**2 + 2/dz**2)
-            
-            # DCTベースの正確な前処理
-            R_hat = dctn(r, type=2, norm='ortho')
-            
-            # 固有値
-            kx = np.arange(nx)
-            ky = np.arange(ny) 
-            kz = np.arange(nz)
-            lamx = 2*(1 - np.cos(np.pi * kx / nx)) / dx**2
-            lamy = 2*(1 - np.cos(np.pi * ky / ny)) / dy**2
-            lamz = 2*(1 - np.cos(np.pi * kz / nz)) / dz**2
-            
-            Lx, Ly, Lz = np.meshgrid(lamx, lamy, lamz, indexing='ij')
-            L = Lx + Ly + Lz
-            
-            # 0モード（定数）の処理
-            L[0,0,0] = 1.0
-            Z_hat = R_hat / L
-            Z_hat[0,0,0] = 0.0  # 平均ゼロ制約
-            
-            z = idctn(Z_hat, type=3, norm='ortho')
-            return z
-        
-        # === 4. ラプラシアン演算子 ===
-        def apply_laplacian(phi):
-            # 7点ステンシルでゴーストセル処理
-            Aphi = np.zeros_like(phi)
-            
-            # X方向の隣接値（ゴーストセル考慮）
-            phi_xp = np.roll(phi, -1, axis=0)
-            phi_xm = np.roll(phi, 1, axis=0)
-            # 外枠Neumann
-            phi_xp[-1,:,:] = phi[-1,:,:]
-            phi_xm[0,:,:] = phi[0,:,:]
-            # 固体隣接はself値に置換
-            phi_xp[solid_plus_x] = phi[solid_plus_x]
-            phi_xm[solid_minus_x] = phi[solid_minus_x]
-            
-            # Y方向
-            phi_yp = np.roll(phi, -1, axis=1)
-            phi_ym = np.roll(phi, 1, axis=1)
-            phi_yp[:,-1,:] = phi[:,-1,:]
-            phi_ym[:,0,:] = phi[:,0,:]
-            phi_yp[solid_plus_y] = phi[solid_plus_y]
-            phi_ym[solid_minus_y] = phi[solid_minus_y]
-            
-            # Z方向
-            phi_zp = np.roll(phi, -1, axis=2)
-            phi_zm = np.roll(phi, 1, axis=2)
-            phi_zp[:,:,-1] = phi[:,:,-1]
-            phi_zm[:,:,0] = phi[:,:,0]
-            phi_zp[solid_plus_z] = phi[solid_plus_z]
-            phi_zm[solid_minus_z] = phi[solid_minus_z]
-            
-            # ラプラシアン
-            Aphi = ((phi_xp - 2*phi + phi_xm) / dx**2 +
-                   (phi_yp - 2*phi + phi_ym) / dy**2 +
-                   (phi_zp - 2*phi + phi_zm) / dz**2)
-            
-            # 固体セルは0（流体領域のみ作用）
-            Aphi[solid_mask] = 0.0
-            
-            return Aphi
-        
-        # デバッグ出力
-        print(f"      b range: {b.min():.3e} .. {b.max():.3e},  ||b||₂={np.linalg.norm(b):.3e}")
+        # === 2. 疎行列版ラプラシアンの組み立て ===
+        print(f"      Fluid cells: {fluid_mask.sum()} / {nx*ny*nz}")
         print(f"      Boundary cells: +x:{int(solid_plus_x.sum())} -x:{int(solid_minus_x.sum())} "
               f"+y:{int(solid_plus_y.sum())} -y:{int(solid_minus_y.sum())} "
               f"+z:{int(solid_plus_z.sum())} -z:{int(solid_minus_z.sum())}")
-        print(f"      Nonzero(b): {int(np.count_nonzero(np.abs(b) > 0))}")
-        print(f"      Fluid ratio: {float(fluid_mask.mean()):.3f}")
         
-        # === 5. PCG法 ===
-        print("      Solving with PCG...")
-        phi = np.zeros((nx, ny, nz), dtype=np.float64)
-        r = project_fluid(b - apply_laplacian(phi))
-        z = project_fluid(neumann_poisson_precond(r))
-        p = z.copy()
-        rz_old = np.sum(r * z)
+        # 疎行列とRHSを組み立て
+        A, b_lin = self._assemble_masked_poisson(
+            fluid_mask, solid_mask,
+            solid_plus_x, solid_minus_x,
+            solid_plus_y, solid_minus_y,
+            solid_plus_z, solid_minus_z,
+            dx, dy, dz, Ux, Uy, Uz
+        )
         
-        # 初期残差ノルム
-        r0_norm = max(np.linalg.norm(r), 1e-30)
-        print(f"      Initial residual: ||r0||₂ = {r0_norm:.2e}")
+        # === 3. 線形ソルバーで解く ===
+        from scipy.sparse.linalg import cg
+        try:
+            import pyamg
+            HAS_AMG = True
+            print("      Using AMG preconditioner (optimal for Poisson)")
+        except ImportError:
+            HAS_AMG = False
+            print("      pyamg not available, using unpreconditioned CG")
         
-        tol = 1e-8
-        max_iter = 300
+        # 前処理の設定
+        M = None
+        if HAS_AMG:
+            ml = pyamg.ruge_stuben_solver(A.tocsr())
+            M = ml.aspreconditioner()
         
-        for iteration in range(1, max_iter + 1):
-            Ap = project_fluid(apply_laplacian(p))
-            den = np.sum(p * Ap) + 1e-30
-            alpha = rz_old / den
-            phi = phi + alpha * p
-            r = project_fluid(r - alpha * Ap)
-            
-            res_norm = np.linalg.norm(r)
-            rel_res = res_norm / r0_norm  # 初期残差に対する相対値
-            
-            if rel_res <= tol:
-                print(f"        Converged at iteration {iteration}, rel_residual = {rel_res:.2e}")
-                break
-                
-            z = project_fluid(neumann_poisson_precond(r))
-            rz_new = np.sum(r * z)
-            beta = rz_new / (rz_old + 1e-30)
-            p = project_fluid(z + beta * p)
-            rz_old = rz_new
-            
-            if iteration % 50 == 0:
-                print(f"        Iteration {iteration}: rel_residual = {rel_res:.2e}")
+        # CG法で解く
+        print("      Solving with Conjugate Gradient...")
+        phi_lin, info = cg(A.tocsr(), b_lin, M=M, tol=1e-8, maxiter=500)
         
-        # === 6. ゲージ固定（流体領域の平均ゼロ） ===
+        if info == 0:
+            print(f"        Converged successfully!")
+        else:
+            print(f"        Warning: CG did not converge (info={info})")
+        
+        # === 4. 3Dグリッドに戻す ===
+        phi = self._scatter_linear_to_3d(phi_lin, fluid_mask)
+        
+        # === 5. 最終的な診断 ===
+        # 流体領域の平均（ゲージ固定により自動的にゼロに近いはず）
         phi_mean = phi[fluid_mask].mean()
-        phi -= phi_mean
-        print(f"        Gauge fixing: subtracted mean = {phi_mean:.2e}")
+        print(f"        Solution mean in fluid: {phi_mean:.2e}")
         
-        # 最終残差（流体領域のみ）
-        final_res = np.linalg.norm(project_fluid(apply_laplacian(phi) - b))
-        print(f"        Final: ||P(Aϕ - b)||₂ = {final_res:.2e}")
+        # 残差の確認（疎行列版）
+        A_full = A.tocsr()
+        residual = A_full @ phi_lin - b_lin
+        residual_norm = np.linalg.norm(residual)
+        print(f"        Final residual: ||Aϕ - b||₂ = {residual_norm:.2e}")
         
         return phi, Ux, Uy, Uz  # 速度成分も返す
     
