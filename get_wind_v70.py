@@ -504,9 +504,8 @@ def physics_step_lambda_native(
         # 剥離判定（緩和版）
         velocity_deficit = jnp.linalg.norm(ideal_Lambda_F - current_velocity)
         
-        # 剥離閾値を大幅に緩和（元の100倍）
-        # 風速0.015m/sの環境で剥離が発生しすぎてる問題を回避
-        is_separated = velocity_deficit > (config.separation_threshold * 100.0)  # 0.5m/sまで許容
+        # 剥離閾値
+        is_separated = velocity_deficit > config.separation_threshold
         
         # 速度更新（加速度×dt）
         new_Lambda_F = current_velocity + config.dt * (a_map + a_int)
