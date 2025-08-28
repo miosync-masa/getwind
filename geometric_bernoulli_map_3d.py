@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Geometric Bernoulli Map 3D Generator for GET Wind™
-完全3次元幾何学的構造マップ生成器
+完全3次元幾何学的構造マップ生成器 - GPU Edition
 ～2Dの限界を超えて、真の物理を駆動する～
 
-環ちゃん & ご主人さま Ultimate 3D Edition! 💕
+環ちゃん & ご主人さま Ultimate 3D GPU Edition! 💕
 """
 
 import numpy as np
@@ -20,6 +20,17 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 import gc
+
+# GPU/CPU切り替え
+try:
+    import cupy as cp
+    HAS_GPU = True
+    print("🚀 GPU Mode Enabled! Using CuPy for acceleration")
+    xp = cp  # NumPy互換インターフェース
+except ImportError:
+    HAS_GPU = False
+    print("⚠️ CuPy not found, falling back to CPU mode")
+    xp = np
 
 # 追加インポート（PCG用）
 try:
@@ -109,15 +120,17 @@ class GeometricBernoulli3D:
         
         print("=" * 70)
         print("GET Wind™ 3D Geometric Bernoulli Map Generator")
-        print("環ちゃん & ご主人さま Ultimate 3D Edition! 💕")
+        print("環ちゃん & ご主人さま Ultimate 3D GPU Edition! 💕" if HAS_GPU else 
+              "環ちゃん & ご主人さま Ultimate 3D Edition! 💕")
         print("=" * 70)
         print(f"\nInitializing 3D grid: {grid.nx}×{grid.ny}×{grid.nz}")
         print(f"Memory estimate: ~{self._estimate_memory():.1f} GB")
+        print(f"Compute device: {'GPU (CuPy)' if HAS_GPU else 'CPU (NumPy)'}")
         
-        # 3Dグリッド生成
-        self.x = np.linspace(grid.x_min, grid.x_max, grid.nx)
-        self.y = np.linspace(grid.y_min, grid.y_max, grid.ny)
-        self.z = np.linspace(grid.z_min, grid.z_max, grid.nz)
+        # 3Dグリッド生成（GPU/CPU対応）
+        self.x = xp.linspace(grid.x_min, grid.x_max, grid.nx)
+        self.y = xp.linspace(grid.y_min, grid.y_max, grid.ny)
+        self.z = xp.linspace(grid.z_min, grid.z_max, grid.nz)
         
         # メモリ効率のため、必要時にのみmeshgridを生成
         self._X = None
@@ -137,7 +150,7 @@ class GeometricBernoulli3D:
     @property
     def X(self):
         if self._X is None:
-            self._X, self._Y, self._Z = np.meshgrid(
+            self._X, self._Y, self._Z = xp.meshgrid(
                 self.x, self.y, self.z, indexing='ij'
             )
         return self._X
@@ -145,7 +158,7 @@ class GeometricBernoulli3D:
     @property
     def Y(self):
         if self._Y is None:
-            self._X, self._Y, self._Z = np.meshgrid(
+            self._X, self._Y, self._Z = xp.meshgrid(
                 self.x, self.y, self.z, indexing='ij'
             )
         return self._Y
@@ -153,7 +166,7 @@ class GeometricBernoulli3D:
     @property
     def Z(self):
         if self._Z is None:
-            self._X, self._Y, self._Z = np.meshgrid(
+            self._X, self._Y, self._Z = xp.meshgrid(
                 self.x, self.y, self.z, indexing='ij'
             )
         return self._Z
@@ -266,12 +279,12 @@ class GeometricBernoulli3D:
         U = self.flow.U_inf
         
         # === STEP 1: 純粋な理想流（ポテンシャル流）===
-        u_ideal = np.zeros((self.grid.nx, self.grid.ny, self.grid.nz))
-        v_ideal = np.zeros_like(u_ideal)
-        w_ideal = np.zeros_like(u_ideal)
+        u_ideal = xp.zeros((self.grid.nx, self.grid.ny, self.grid.nz))
+        v_ideal = xp.zeros_like(u_ideal)
+        w_ideal = xp.zeros_like(u_ideal)
         
         if self.obstacle.shape_type == 'cylinder':
-            # 円柱まわりの2Dポテンシャル流（迎角対応）
+            # 円柱まわりの2Dポテンシャル流（迎角対応）- ベクトル化版
             print("    Computing ideal potential flow around cylinder...")
             
             # 迎角から速度成分を計算
@@ -285,33 +298,42 @@ class GeometricBernoulli3D:
                 print(f"    Flow with angle: α={self.obstacle.angle_of_attack}°, β={self.obstacle.angle_beta}°")
                 print(f"    Components: Ux={Ux:.3f}, Uy={Uy:.3f}, Uz={Uz:.3f} m/s")
             
-            for i in range(self.grid.nx):
-                for j in range(self.grid.ny):
-                    dx = self.x[i] - cx
-                    dy = self.y[j] - cy
-                    r = np.sqrt(dx**2 + dy**2)
-                    
-                    if r > R * 1.01:  # 表面から少し離す（数値安定性）
-                        # 迎角を考慮した座標系での解析解
-                        # 流入方向をx'軸とした座標系での計算
-                        x_prime = dx * np.cos(alpha_rad) + dy * np.sin(alpha_rad)
-                        y_prime = -dx * np.sin(alpha_rad) + dy * np.cos(alpha_rad)
-                        theta_prime = np.arctan2(y_prime, x_prime)
-                        
-                        # x'-y'座標系での速度（円柱理想流）
-                        U_mag = np.sqrt(Ux**2 + Uy**2)  # XY平面内の流速
-                        u_prime = U_mag * (1 - (R/r)**2 * np.cos(2*theta_prime))
-                        v_prime = -U_mag * (R/r)**2 * np.sin(2*theta_prime)
-                        
-                        # 元の座標系に戻す
-                        u_ideal[i,j,:] = u_prime * np.cos(alpha_rad) - v_prime * np.sin(alpha_rad)
-                        v_ideal[i,j,:] = u_prime * np.sin(alpha_rad) + v_prime * np.cos(alpha_rad)
-                        w_ideal[i,j,:] = Uz  # Z成分は一様
-                    else:
-                        # 円柱内部は速度ゼロ
-                        u_ideal[i,j,:] = 0
-                        v_ideal[i,j,:] = 0
-                        w_ideal[i,j,:] = 0
+            # ベクトル化版：全グリッド点を一度に計算
+            X, Y, Z = xp.meshgrid(self.x, self.y, self.z, indexing='ij')
+            dx = X - cx
+            dy = Y - cy
+            r = xp.sqrt(dx**2 + dy**2)
+            
+            # 円柱外部のマスク
+            outside_mask = r > R * 1.01
+            
+            # 迎角を考慮した座標系での解析解（ベクトル化）
+            x_prime = dx * np.cos(alpha_rad) + dy * np.sin(alpha_rad)
+            y_prime = -dx * np.sin(alpha_rad) + dy * np.cos(alpha_rad)
+            theta_prime = xp.arctan2(y_prime, x_prime)
+            
+            # x'-y'座標系での速度（円柱理想流）
+            U_mag = np.sqrt(Ux**2 + Uy**2)  # XY平面内の流速
+            
+            # 速度場をゼロで初期化
+            u_prime = xp.zeros_like(X)
+            v_prime = xp.zeros_like(X)
+            
+            # 円柱外部のみ計算
+            r_safe = xp.where(outside_mask, r, 1.0)  # ゼロ除算回避
+            u_prime[outside_mask] = U_mag * (1 - (R/r_safe[outside_mask])**2 * xp.cos(2*theta_prime[outside_mask]))
+            v_prime[outside_mask] = -U_mag * (R/r_safe[outside_mask])**2 * xp.sin(2*theta_prime[outside_mask])
+            
+            # 元の座標系に戻す
+            u_ideal = u_prime * np.cos(alpha_rad) - v_prime * np.sin(alpha_rad)
+            v_ideal = u_prime * np.sin(alpha_rad) + v_prime * np.cos(alpha_rad)
+            w_ideal = xp.ones_like(X) * Uz  # Z成分は一様
+            
+            # 円柱内部は速度ゼロに強制
+            inside_mask = ~outside_mask
+            u_ideal[inside_mask] = 0
+            v_ideal[inside_mask] = 0
+            w_ideal[inside_mask] = 0
                     
         elif self.obstacle.shape_type == 'square':
             # 角柱：数値ラプラシアン解法で厳密なポテンシャル流
@@ -326,8 +348,8 @@ class GeometricBernoulli3D:
             
             # φ = U·x + ϕ の再構成
             print("    Reconstructing potential φ = U·x + ϕ...")
-            # 座標グリッド（グリッド単位）
-            X_grid, Y_grid, Z_grid = np.meshgrid(
+            # 座標グリッド（グリッド単位）- GPU/CPU統一
+            X_grid, Y_grid, Z_grid = xp.meshgrid(
                 self.x, self.y, self.z, indexing='ij'
             )
             
@@ -371,37 +393,55 @@ class GeometricBernoulli3D:
             'vector_potential_z': psi_z
         }
     
+    def _shift_neumann(self, phi, axis, h, g_plus, g_minus, solid, fluid):
+        """Neumann境界条件での shift & 中央差分（roll禁止版）"""
+        # +1, -1 を境界複製で作る
+        slicer_fwd = [slice(None)]*3; slicer_fwd[axis] = slice(1, None)
+        slicer_bwd = [slice(None)]*3; slicer_bwd[axis] = slice(None, -1)
+        phi_p = xp.empty_like(phi); phi_m = xp.empty_like(phi)
+        phi_p[tuple(slicer_bwd)] = phi[tuple(slicer_fwd)]
+        phi_m[tuple(slicer_fwd)] = phi[tuple(slicer_bwd)]
+        
+        # 境界は複製（Neumann BC）
+        if axis == 0:
+            phi_p[-1,:,:] = phi[-1,:,:]
+            phi_m[0,:,:] = phi[0,:,:]
+        elif axis == 1:
+            phi_p[:,-1,:] = phi[:,-1,:]
+            phi_m[:,0,:] = phi[:,0,:]
+        else:
+            phi_p[:,:,-1] = phi[:,:,-1]
+            phi_m[:,:,0] = phi[:,:,0]
+        
+        # 固体が隣接する面はゴースト置換（∂φ/∂n = g）
+        if axis==0:
+            solid_p = xp.roll(solid,-1,0)
+            solid_m = xp.roll(solid,+1,0)
+            phi_p[solid_p & fluid] = phi[solid_p & fluid] + g_plus*h
+            phi_m[solid_m & fluid] = phi[solid_m & fluid] + g_minus*h
+        elif axis==1:
+            solid_p = xp.roll(solid,-1,1)
+            solid_m = xp.roll(solid,+1,1)
+            phi_p[solid_p & fluid] = phi[solid_p & fluid] + g_plus*h
+            phi_m[solid_m & fluid] = phi[solid_m & fluid] + g_minus*h
+        else:
+            solid_p = xp.roll(solid,-1,2)
+            solid_m = xp.roll(solid,+1,2)
+            phi_p[solid_p & fluid] = phi[solid_p & fluid] + g_plus*h
+            phi_m[solid_m & fluid] = phi[solid_m & fluid] + g_minus*h
+            
+        return (phi_p - phi_m)/(2*h)
+    
     def _grad_with_neumann_ghost(self, phi, level_set, Ux, Uy, Uz):
-        """Neumann境界条件を考慮した勾配計算（ゴーストセル法）"""
+        """Neumann境界条件を考慮した勾配計算（改良版）"""
         solid = (level_set < 0)
         fluid = ~solid
-        roll = np.roll
-
-        # x方向
-        phi_xp = roll(phi, -1, axis=0); xp_solid = roll(solid, -1, axis=0)
-        phi_xm = roll(phi, +1, axis=0); xm_solid = roll(solid, +1, axis=0)
-        # +x 側が固体なら φ_{i+1} = φ_i + g*dx,  g = -Ux
-        phi_xp[ xp_solid & fluid ] = phi[ xp_solid & fluid ] + (-Ux)*self.grid.dx
-        # -x 側が固体なら φ_{i-1} = φ_i + g*dx,  ただし n=-ex → g=+Ux
-        phi_xm[ xm_solid & fluid ] = phi[ xm_solid & fluid ] + (+Ux)*self.grid.dx
-        dudx = (phi_xp - phi_xm) / (2*self.grid.dx)
-
-        # y方向
-        phi_yp = roll(phi, -1, axis=1); yp_solid = roll(solid, -1, axis=1)
-        phi_ym = roll(phi, +1, axis=1); ym_solid = roll(solid, +1, axis=1)
-        phi_yp[ yp_solid & fluid ] = phi[ yp_solid & fluid ] + (-Uy)*self.grid.dy
-        phi_ym[ ym_solid & fluid ] = phi[ ym_solid & fluid ] + (+Uy)*self.grid.dy
-        dvdy = (phi_yp - phi_ym) / (2*self.grid.dy)
-
-        # z方向
-        phi_zp = roll(phi, -1, axis=2); zp_solid = roll(solid, -1, axis=2)
-        phi_zm = roll(phi, +1, axis=2); zm_solid = roll(solid, +1, axis=2)
-        phi_zp[ zp_solid & fluid ] = phi[ zp_solid & fluid ] + (-Uz)*self.grid.dz
-        phi_zm[ zm_solid & fluid ] = phi[ zm_solid & fluid ] + (+Uz)*self.grid.dz
-        dwdz = (phi_zp - phi_zm) / (2*self.grid.dz)
-
-        # 速度は u = ∇φ
-        u = dudx; v = dvdy; w = dwdz
+        
+        # 各軸での勾配計算（roll禁止版）
+        u = self._shift_neumann(phi, 0, self.grid.dx, -Ux, Ux, solid, fluid)
+        v = self._shift_neumann(phi, 1, self.grid.dy, -Uy, Uy, solid, fluid)
+        w = self._shift_neumann(phi, 2, self.grid.dz, -Uz, Uz, solid, fluid)
+        
         # 固体内はゼロ
         u[solid] = v[solid] = w[solid] = 0.0
         return u, v, w
@@ -444,53 +484,65 @@ class GeometricBernoulli3D:
     
     def _compute_level_set_square(self, cx: float, cy: float, cz: float, 
                                   R: float) -> np.ndarray:
-        """角柱のレベルセット関数（符号付き距離）を計算
+        """角柱のレベルセット関数（符号付き距離）を計算 - ベクトル化版
         
         内部: < 0, 外部: > 0
         物体回転対応版
         """
-        level_set = np.zeros((self.grid.nx, self.grid.ny, self.grid.nz))
+        # 全グリッド点の座標を一度に生成
+        X, Y, Z = xp.meshgrid(self.x, self.y, self.z, indexing='ij')
         
-        for i in range(self.grid.nx):
-            for j in range(self.grid.ny):
-                for k in range(self.grid.nz):
-                    x, y, z = self.x[i], self.y[j], self.z[k]
-                    
-                    # 物体座標系に変換
-                    xb, yb, zb = self._world_to_body(x, y, z)
-                    
-                    # 角柱の半寸法
-                    hx = R
-                    hy = R  
-                    hz = self.obstacle.span / 2
-                    
-                    # 符号付き距離（物体座標系で計算）
-                    dx = np.abs(xb) - hx
-                    dy = np.abs(yb) - hy
-                    dz = np.abs(zb) - hz
-                    
-                    # 外部距離
-                    if dx > 0 and dy > 0 and dz > 0:
-                        # コーナー領域（3D）
-                        level_set[i,j,k] = np.sqrt(dx**2 + dy**2 + dz**2)
-                    elif dx > 0 and dy > 0:
-                        # エッジ領域（XY）
-                        level_set[i,j,k] = np.sqrt(dx**2 + dy**2)
-                    elif dy > 0 and dz > 0:
-                        # エッジ領域（YZ）
-                        level_set[i,j,k] = np.sqrt(dy**2 + dz**2)
-                    elif dx > 0 and dz > 0:
-                        # エッジ領域（XZ）
-                        level_set[i,j,k] = np.sqrt(dx**2 + dz**2)
-                    elif dx > 0:
-                        level_set[i,j,k] = dx
-                    elif dy > 0:
-                        level_set[i,j,k] = dy
-                    elif dz > 0:
-                        level_set[i,j,k] = dz
-                    else:
-                        # 内部（最も近い面までの距離）
-                        level_set[i,j,k] = max(dx, dy, dz)
+        # 物体座標系に変換（ベクトル化）
+        xb, yb, zb = self._world_to_body(X, Y, Z)
+        
+        # 角柱の半寸法
+        hx = R
+        hy = R  
+        hz = self.obstacle.span / 2
+        
+        # 符号付き距離（全点同時計算）
+        dx = xp.abs(xb) - hx
+        dy = xp.abs(yb) - hy
+        dz = xp.abs(zb) - hz
+        
+        # 各軸での最大値（内部判定用）- CuPy対応版！
+        max_dist = xp.maximum(xp.maximum(dx, dy), dz)
+        
+        # 外部距離の計算（条件分岐をベクトル化）
+        # コーナー領域（3D）
+        corner_mask = (dx > 0) & (dy > 0) & (dz > 0)
+        corner_dist = xp.sqrt(dx**2 + dy**2 + dz**2)
+        
+        # エッジ領域（XY）
+        edge_xy_mask = (dx > 0) & (dy > 0) & (dz <= 0)
+        edge_xy_dist = xp.sqrt(dx**2 + dy**2)
+        
+        # エッジ領域（YZ）
+        edge_yz_mask = (dx <= 0) & (dy > 0) & (dz > 0)
+        edge_yz_dist = xp.sqrt(dy**2 + dz**2)
+        
+        # エッジ領域（XZ）
+        edge_xz_mask = (dx > 0) & (dy <= 0) & (dz > 0)
+        edge_xz_dist = xp.sqrt(dx**2 + dz**2)
+        
+        # 面領域
+        face_x_mask = (dx > 0) & (dy <= 0) & (dz <= 0)
+        face_y_mask = (dx <= 0) & (dy > 0) & (dz <= 0)
+        face_z_mask = (dx <= 0) & (dy <= 0) & (dz > 0)
+        
+        # 内部領域
+        inside_mask = (dx <= 0) & (dy <= 0) & (dz <= 0)
+        
+        # 全体のレベルセット関数を組み立て
+        level_set = xp.zeros_like(X)
+        level_set[corner_mask] = corner_dist[corner_mask]
+        level_set[edge_xy_mask] = edge_xy_dist[edge_xy_mask]
+        level_set[edge_yz_mask] = edge_yz_dist[edge_yz_mask]
+        level_set[edge_xz_mask] = edge_xz_dist[edge_xz_mask]
+        level_set[face_x_mask] = dx[face_x_mask]
+        level_set[face_y_mask] = dy[face_y_mask]
+        level_set[face_z_mask] = dz[face_z_mask]
+        level_set[inside_mask] = max_dist[inside_mask]  # 内部（最も近い面までの距離）
         
         return level_set
     
@@ -588,12 +640,18 @@ class GeometricBernoulli3D:
             # ここで対角を1回だけ push
             row.append(p); col.append(p); data.append(diag)
 
-        # ゲージ固定：最初の流体セルを完全に置換
+        # ゲージ固定：最初の流体セルを完全に置換（行・列ゼロ化）
+        # COO形式では重複エントリが自動的に加算されるので、
+        # 先に構築してからLIL形式で修正する
+        A_temp = coo_matrix((data,(row,col)), shape=(N,N))
+        A = A_temp.tolil()
         p0 = 0
-        row.append(p0); col.append(p0); data.append(1.0)
+        A[p0,:] = 0
+        A[:,p0] = 0
+        A[p0,p0] = 1.0
         b[p0] = 0.0
-
-        A = coo_matrix((data,(row,col)), shape=(N,N))
+        A = A.tocsr()
+        
         return A, b
     
     def _scatter_linear_to_3d(self, phi_lin, fluid_mask):
@@ -627,8 +685,13 @@ class GeometricBernoulli3D:
         print(f"      Flow components: Ux={Ux:.3f}, Uy={Uy:.3f}, Uz={Uz:.3f} m/s")
         print(f"      Angle of attack: α={self.obstacle.angle_of_attack}°, β={self.obstacle.angle_beta}°")
         
-        # === 1. マスクの構築 ===
-        solid_mask = level_set < 0
+        # === 1. マスクの構築（GPU→CPU転送）===
+        if HAS_GPU:
+            level_set_cpu = level_set.get()  # CuPy → NumPy
+        else:
+            level_set_cpu = level_set
+            
+        solid_mask = level_set_cpu < 0
         fluid_mask = ~solid_mask
         
         # 流体セルで隣接が固体かをチェック
@@ -657,7 +720,7 @@ class GeometricBernoulli3D:
               f"+y:{int(solid_plus_y.sum())} -y:{int(solid_minus_y.sum())} "
               f"+z:{int(solid_plus_z.sum())} -z:{int(solid_minus_z.sum())}")
         
-        # 疎行列とRHSを組み立て
+        # 疎行列とRHSを組み立て（CPU上で）
         A, b_lin = self._assemble_masked_poisson(
             fluid_mask, solid_mask,
             solid_plus_x, solid_minus_x,
@@ -666,7 +729,7 @@ class GeometricBernoulli3D:
             dx, dy, dz, Ux, Uy, Uz
         )
         
-        # === 3. 線形ソルバーで解く ===
+        # === 3. 線形ソルバーで解く（CPU上）===
         from scipy.sparse.linalg import cg
         try:
             import pyamg
@@ -684,7 +747,7 @@ class GeometricBernoulli3D:
         
         # CG法で解く
         print("      Solving with Conjugate Gradient...")
-        phi_lin, info = cg(A.tocsr(), b_lin, M=M, tol=1e-8, maxiter=500)
+        phi_lin, info = cg(A.tocsr(), b_lin, M=M, atol=1e-8, maxiter=500)
         
         if info == 0:
             print(f"        Converged successfully!")
@@ -692,11 +755,20 @@ class GeometricBernoulli3D:
             print(f"        Warning: CG did not converge (info={info})")
         
         # === 4. 3Dグリッドに戻す ===
-        phi = self._scatter_linear_to_3d(phi_lin, fluid_mask)
+        phi_cpu = self._scatter_linear_to_3d(phi_lin, fluid_mask)
         
-        # === 5. 最終的な診断 ===
+        # === 5. GPU に転送（必要なら）===
+        if HAS_GPU:
+            phi = xp.asarray(phi_cpu)
+        else:
+            phi = phi_cpu
+        
+        # === 6. 最終的な診断 ===
         # 流体領域の平均（ゲージ固定により自動的にゼロに近いはず）
-        phi_mean = phi[fluid_mask].mean()
+        if HAS_GPU:
+            phi_mean = float(phi[xp.asarray(fluid_mask)].mean())
+        else:
+            phi_mean = phi[fluid_mask].mean()
         print(f"        Solution mean in fluid: {phi_mean:.2e}")
         
         # 残差の確認（疎行列版）
@@ -757,9 +829,9 @@ class GeometricBernoulli3D:
     def _compute_divergence(self, u: np.ndarray, v: np.ndarray, 
                           w: np.ndarray) -> np.ndarray:
         """速度場の発散を計算"""
-        dudx = np.gradient(u, self.grid.dx, axis=0)
-        dvdy = np.gradient(v, self.grid.dy, axis=1)
-        dwdz = np.gradient(w, self.grid.dz, axis=2)
+        dudx = xp.gradient(u, self.grid.dx, axis=0)
+        dvdy = xp.gradient(v, self.grid.dy, axis=1)
+        dwdz = xp.gradient(w, self.grid.dz, axis=2)
         return dudx + dvdy + dwdz
     
     def _solve_poisson_3d(self, rhs: np.ndarray, max_iter: int = 100,
@@ -854,7 +926,7 @@ class GeometricBernoulli3D:
         }
     
     def _calculate_vortex_map(self, velocity_map: Dict) -> Dict[str, np.ndarray]:
-        """Map 3: 渦構造テンソルの計算"""
+        """Map 3: 渦構造テンソルの計算 - ベクトル化版"""
         u = velocity_map['velocity_u']
         v = velocity_map['velocity_v']
         w = velocity_map['velocity_w']
@@ -864,29 +936,39 @@ class GeometricBernoulli3D:
         omega_y = np.gradient(u, self.grid.dz, axis=2) - np.gradient(w, self.grid.dx, axis=0)
         omega_z = np.gradient(v, self.grid.dx, axis=0) - np.gradient(u, self.grid.dy, axis=1)
         
-        # 速度勾配テンソル
-        grad_u = np.zeros((self.grid.nx, self.grid.ny, self.grid.nz, 3, 3))
+        # 速度勾配テンソル（全点同時計算）
+        dudx = np.gradient(u, self.grid.dx, axis=0)
+        dudy = np.gradient(u, self.grid.dy, axis=1)
+        dudz = np.gradient(u, self.grid.dz, axis=2)
+        dvdx = np.gradient(v, self.grid.dx, axis=0)
+        dvdy = np.gradient(v, self.grid.dy, axis=1)
+        dvdz = np.gradient(v, self.grid.dz, axis=2)
+        dwdx = np.gradient(w, self.grid.dx, axis=0)
+        dwdy = np.gradient(w, self.grid.dy, axis=1)
+        dwdz = np.gradient(w, self.grid.dz, axis=2)
         
-        # ∂u_i/∂x_j
-        grad_u[:,:,:,0,0] = np.gradient(u, self.grid.dx, axis=0)
-        grad_u[:,:,:,0,1] = np.gradient(u, self.grid.dy, axis=1)
-        grad_u[:,:,:,0,2] = np.gradient(u, self.grid.dz, axis=2)
-        grad_u[:,:,:,1,0] = np.gradient(v, self.grid.dx, axis=0)
-        grad_u[:,:,:,1,1] = np.gradient(v, self.grid.dy, axis=1)
-        grad_u[:,:,:,1,2] = np.gradient(v, self.grid.dz, axis=2)
-        grad_u[:,:,:,2,0] = np.gradient(w, self.grid.dx, axis=0)
-        grad_u[:,:,:,2,1] = np.gradient(w, self.grid.dy, axis=1)
-        grad_u[:,:,:,2,2] = np.gradient(w, self.grid.dz, axis=2)
+        # Q判定基準（ベクトル化版）
+        # 歪み速度テンソル S_ij = 0.5(∂u_i/∂x_j + ∂u_j/∂x_i)
+        S11 = dudx
+        S22 = dvdy
+        S33 = dwdz
+        S12 = 0.5 * (dudy + dvdx)
+        S13 = 0.5 * (dudz + dwdx)
+        S23 = 0.5 * (dvdz + dwdy)
         
-        # Q判定基準
-        Q = np.zeros((self.grid.nx, self.grid.ny, self.grid.nz))
-        for i in range(self.grid.nx):
-            for j in range(self.grid.ny):
-                for k in range(self.grid.nz):
-                    G = grad_u[i,j,k]
-                    S = 0.5 * (G + G.T)  # 歪み速度テンソル
-                    Omega = 0.5 * (G - G.T)  # 回転テンソル
-                    Q[i,j,k] = 0.5 * (np.trace(Omega @ Omega.T) - np.trace(S @ S.T))
+        # 回転テンソル Ω_ij = 0.5(∂u_i/∂x_j - ∂u_j/∂x_i)
+        O12 = 0.5 * (dudy - dvdx)
+        O13 = 0.5 * (dudz - dwdx)
+        O23 = 0.5 * (dvdz - dwdy)
+        
+        # ||S||² = S_ij S_ij（全点同時計算）- 修正版
+        S_squared = (S11**2 + S22**2 + S33**2) + 2*(S12**2 + S13**2 + S23**2)
+        
+        # ||Ω||² = Ω_ij Ω_ij（全点同時計算）
+        Omega_squared = 2 * (O12**2 + O13**2 + O23**2)
+        
+        # Q = 0.5(||Ω||² - ||S||²)
+        Q = 0.5 * (Omega_squared - S_squared)
         
         # λ2基準（簡易版）
         lambda2 = np.zeros_like(Q)
@@ -1245,7 +1327,8 @@ class GeometricBernoulli3D:
             'flow': self.flow.__dict__,
             'grid': self.grid.__dict__,
             'physics_params': self.physics_params,
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'computed_on': 'GPU (CuPy)' if HAS_GPU else 'CPU (NumPy)'
         }
         
         # 各マップを個別に保存
@@ -1253,9 +1336,21 @@ class GeometricBernoulli3D:
             filename = f"{base_name}_{map_name}.npz"
             
             print(f"  Saving {filename}...", end='')
+            
+            # GPU→CPU転送（必要なら）
+            if HAS_GPU:
+                map_data_cpu = {}
+                for k, v in map_data.items():
+                    if hasattr(v, 'get'):  # CuPy配列の場合
+                        map_data_cpu[k] = v.get()
+                    else:
+                        map_data_cpu[k] = v
+            else:
+                map_data_cpu = map_data
+                
             np.savez_compressed(
                 filename,
-                **map_data,
+                **map_data_cpu,
                 metadata=json.dumps(metadata)
             )
             
@@ -1270,12 +1365,18 @@ class GeometricBernoulli3D:
         ) / (1024**3)
         
         print(f"\n✨ Total size: {total_size_gb:.2f} GB")
-        print(f"🎯 Ready for GET Wind™ v7.0 3D simulation!")
+        print(f"🎯 Ready for GET Wind™ v7.0 3D simulation! {'(GPU Computed)' if HAS_GPU else ''}")
     
     def visualize_slice(self, field: np.ndarray, field_name: str, 
                         slice_type: str = 'z', slice_index: int = None) -> None:
         """3D場の2Dスライス可視化"""
         
+        # GPU→CPU転送（必要なら）
+        if HAS_GPU and hasattr(field, 'get'):
+            field_cpu = field.get()
+        else:
+            field_cpu = field
+            
         if slice_index is None:
             if slice_type == 'z':
                 slice_index = self.grid.nz // 2
@@ -1287,26 +1388,26 @@ class GeometricBernoulli3D:
         fig, ax = plt.subplots(figsize=(12, 6))
         
         if slice_type == 'z':
-            data = field[:, :, slice_index].T
+            data = field_cpu[:, :, slice_index].T
             extent = [self.grid.x_min, self.grid.x_max, 
                      self.grid.y_min, self.grid.y_max]
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
-            title_suffix = f"Z = {self.z[slice_index]:.1f}"
+            title_suffix = f"Z = {self.z[slice_index]:.1f}" if HAS_GPU else f"Z = {self.z[slice_index]:.1f}"
         elif slice_type == 'y':
-            data = field[:, slice_index, :].T
+            data = field_cpu[:, slice_index, :].T
             extent = [self.grid.x_min, self.grid.x_max,
                      self.grid.z_min, self.grid.z_max]
             ax.set_xlabel('X')
             ax.set_ylabel('Z')
-            title_suffix = f"Y = {self.y[slice_index]:.1f}"
+            title_suffix = f"Y = {self.y[slice_index]:.1f}" if HAS_GPU else f"Y = {self.y[slice_index]:.1f}"
         else:
-            data = field[slice_index, :, :].T
+            data = field_cpu[slice_index, :, :].T
             extent = [self.grid.y_min, self.grid.y_max,
                      self.grid.z_min, self.grid.z_max]
             ax.set_xlabel('Y')
             ax.set_ylabel('Z')
-            title_suffix = f"X = {self.x[slice_index]:.1f}"
+            title_suffix = f"X = {self.x[slice_index]:.1f}" if HAS_GPU else f"X = {self.x[slice_index]:.1f}"
         
         im = ax.imshow(data, origin='lower', extent=extent,
                       aspect='equal', cmap='RdBu_r')
@@ -1327,7 +1428,7 @@ class GeometricBernoulli3D:
                 ax.add_patch(rect)
         
         plt.colorbar(im, ax=ax, fraction=0.046)
-        ax.set_title(f"{field_name} - {title_suffix}")
+        ax.set_title(f"{field_name} - {title_suffix} {'[GPU]' if HAS_GPU else '[CPU]'}")
         plt.tight_layout()
         plt.show()
 
