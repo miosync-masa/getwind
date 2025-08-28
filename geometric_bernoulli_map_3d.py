@@ -46,7 +46,7 @@ class Obstacle3DConfig:
 @dataclass
 class Flow3DConfig:
     """3D流れの条件"""
-    U_inf: float = 0.015    # 一様流速度 [m/s] (Re=200に調整)
+    U_inf: float = 0.075    # 一様流速度 [m/s] (Re=200に調整)
     V_inf: float = 0.0       # Y方向速度成分
     W_inf: float = 0.0       # Z方向速度成分
     rho_inf: float = 1.225   # 基準密度 [kg/m³]
