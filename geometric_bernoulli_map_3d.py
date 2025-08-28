@@ -604,38 +604,59 @@ class GeometricBernoulli3D:
                    (phi_yp - 2*phi + phi_ym) / dy**2 +
                    (phi_zp - 2*phi + phi_zm) / dz**2)
             
+            # 固体セルはAφ=φ（恒等）として解空間から外す
+            Aphi[solid_mask] = phi[solid_mask]
+            
             return Aphi
+        
+        # 流体領域への投影関数
+        def project_fluid(arr):
+            out = arr.copy()
+            out[solid_mask] = 0.0
+            return out
+        
+        # デバッグ出力
+        print(f"      b range: {b.min():.3e} .. {b.max():.3e},  ||b||₂={np.linalg.norm(b):.3e}")
+        print(f"      Boundary cells: +x:{int(solid_plus_x.sum())} -x:{int(solid_minus_x.sum())} "
+              f"+y:{int(solid_plus_y.sum())} -y:{int(solid_minus_y.sum())} "
+              f"+z:{int(solid_plus_z.sum())} -z:{int(solid_minus_z.sum())}")
+        print(f"      Nonzero(b): {int(np.count_nonzero(np.abs(b) > 0))}")
+        print(f"      Fluid ratio: {float(fluid_mask.mean()):.3f}")
         
         # === 5. PCG法 ===
         print("      Solving with PCG...")
         phi = np.zeros((nx, ny, nz), dtype=np.float64)
-        r = b - apply_laplacian(phi)
-        z = neumann_poisson_precond(r)
+        r = project_fluid(b - apply_laplacian(phi))
+        z = project_fluid(neumann_poisson_precond(r))
         p = z.copy()
         rz_old = np.sum(r * z)
         
         tol = 1e-8
         max_iter = 300
+        b_norm = np.linalg.norm(b) + 1e-30
         
         for iteration in range(1, max_iter + 1):
-            Ap = apply_laplacian(p)
-            alpha = rz_old / (np.sum(p * Ap) + 1e-30)
+            Ap = project_fluid(apply_laplacian(p))
+            den = np.sum(p * Ap) + 1e-30
+            alpha = rz_old / den
             phi = phi + alpha * p
-            r = r - alpha * Ap
+            r = project_fluid(r - alpha * Ap)
             
             res_norm = np.linalg.norm(r)
-            if res_norm <= tol * np.linalg.norm(b + 1e-30):
-                print(f"        Converged at iteration {iteration}, residual = {res_norm:.2e}")
+            rel_res = res_norm / b_norm
+            
+            if rel_res <= tol:
+                print(f"        Converged at iteration {iteration}, rel_residual = {rel_res:.2e}")
                 break
                 
-            z = neumann_poisson_precond(r)
+            z = project_fluid(neumann_poisson_precond(r))
             rz_new = np.sum(r * z)
             beta = rz_new / (rz_old + 1e-30)
-            p = z + beta * p
+            p = project_fluid(z + beta * p)
             rz_old = rz_new
             
             if iteration % 50 == 0:
-                print(f"        Iteration {iteration}: residual = {res_norm:.2e}")
+                print(f"        Iteration {iteration}: rel_residual = {rel_res:.2e}")
         
         # === 6. ゲージ固定（流体領域の平均ゼロ） ===
         phi_mean = phi[fluid_mask].mean()
@@ -752,8 +773,9 @@ class GeometricBernoulli3D:
         pressure_normalized = pressure / p_inf
         density_normalized = density / rho_inf
         
-        print(f"    Pressure range: {pressure.min()/p_inf:.3f} - {pressure.max()/p_inf:.3f} (normalized)")
-        print(f"    Max |Cp|: {np.max(np.abs(Cp)):.3f}")
+        print(f"    Pressure range [Pa]: {pressure.min():.1f} - {pressure.max():.1f}")
+        print(f"    Pressure range [p/p∞]: {pressure.min()/p_inf:.6f} - {pressure.max()/p_inf:.6f}")
+        print(f"    Cp range: {Cp.min():.3f} - {Cp.max():.3f}")
         
         # ベルヌーイの定理の検証（流線上で全圧一定か）
         total_pressure = pressure + 0.5 * rho_inf * V_squared
@@ -762,7 +784,9 @@ class GeometricBernoulli3D:
         print(f"    Total pressure variation: {tp_std/tp_mean:.2e} (should be ~0 for ideal flow)")
         
         return {
-            'pressure': pressure_normalized,
+            'pressure': pressure_normalized,  # p/p∞（後方互換性）
+            'pressure_Pa': pressure,          # Pascal単位
+            'Cp': Cp,                        # 圧力係数
             'density': density_normalized,
             'temperature': temperature
         }
