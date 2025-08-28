@@ -506,25 +506,25 @@ class GeometricBernoulli3D:
         solid_plus_y, solid_minus_y = get_solid_neighbors(solid_mask, 1)
         solid_plus_z, solid_minus_z = get_solid_neighbors(solid_mask, 2)
         
-        # === 2. 右辺ベクトルbの構築（迎角対応） ===
+        # === 2. 右辺ベクトルbの構築（迎角対応, 係数: 2g/Δ） ===
         b = np.zeros((nx, ny, nz), dtype=np.float64)
         
         # 境界条件: ∂ϕ/∂n = g = -U·n
         # ゴーストセル法では係数は 2g/Δ になる
-        # X面での寄与: n = ±ex
+        # X面での寄与: g = -Ux
         if abs(Ux) > 1e-10:
-            b[solid_plus_x] += (-Ux) * (2.0 / dx)   # +x面: n=+ex, g=-Ux
-            b[solid_minus_x] += (+Ux) * (2.0 / dx)  # -x面: n=-ex, g=+Ux
+            b[solid_plus_x] += (-2.0 * Ux) / dx   # +x面: n=+ex
+            b[solid_minus_x] += (+2.0 * Ux) / dx  # -x面: n=-ex
             
-        # Y面での寄与: n = ±ey
+        # Y面での寄与: g = -Uy
         if abs(Uy) > 1e-10:
-            b[solid_plus_y] += (-Uy) * (2.0 / dy)   # +y面: n=+ey, g=-Uy
-            b[solid_minus_y] += (+Uy) * (2.0 / dy)  # -y面: n=-ey, g=+Uy
+            b[solid_plus_y] += (-2.0 * Uy) / dy   # +y面: n=+ey
+            b[solid_minus_y] += (+2.0 * Uy) / dy  # -y面: n=-ey
             
-        # Z面での寄与: n = ±ez
+        # Z面での寄与: g = -Uz
         if abs(Uz) > 1e-10:
-            b[solid_plus_z] += (-Uz) * (2.0 / dz)   # +z面: n=+ez, g=-Uz
-            b[solid_minus_z] += (+Uz) * (2.0 / dz)  # -z面: n=-ez, g=+Uz
+            b[solid_plus_z] += (-2.0 * Uz) / dz   # +z面: n=+ez
+            b[solid_minus_z] += (+2.0 * Uz) / dz  # -z面: n=-ez
         
         # === 2.5 Neumann整合性（右辺の平均ゼロ化） ===
         b_mean = b[fluid_mask].mean()
