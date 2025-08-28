@@ -5,7 +5,7 @@ Geometric Bernoulli Map 3D Generator for GET Wind™
 完全3次元幾何学的構造マップ生成器
 ～2Dの限界を超えて、真の物理を駆動する～
 
-環ちゃん & ご主人さま Ultimate 3D AMG Edition! 💕
+環ちゃん & ご主人さま Ultimate 3D Edition! 💕
 """
 
 import numpy as np
@@ -334,17 +334,9 @@ class GeometricBernoulli3D:
             # φ = Ux*x + Uy*y + Uz*z + ϕ
             phi = Ux * X_grid + Uy * Y_grid + Uz * Z_grid + phi_perturbation
             
-            # 速度 u = ∇φ
-            print("    Computing velocities from potential...")
-            u_ideal = np.gradient(phi, self.grid.dx, axis=0)
-            v_ideal = np.gradient(phi, self.grid.dy, axis=1)
-            w_ideal = np.gradient(phi, self.grid.dz, axis=2)
-            
-            # 障害物内部は速度ゼロに強制
-            mask = level_set < 0  # 内部
-            u_ideal[mask] = 0
-            v_ideal[mask] = 0
-            w_ideal[mask] = 0
+            # 速度 u = ∇φ（ゴーストセル法で境界を正しく処理）
+            print("    Computing velocities from potential with ghost cells...")
+            u_ideal, v_ideal, w_ideal = self._grad_with_neumann_ghost(phi, level_set, Ux, Uy, Uz)
         
         # === STEP 2: 3D効果の追加（オプション）===
         # 純粋な理想流では3D効果なし（ポテンシャル流保持）
@@ -378,6 +370,41 @@ class GeometricBernoulli3D:
             'vector_potential_y': psi_y,
             'vector_potential_z': psi_z
         }
+    
+    def _grad_with_neumann_ghost(self, phi, level_set, Ux, Uy, Uz):
+        """Neumann境界条件を考慮した勾配計算（ゴーストセル法）"""
+        solid = (level_set < 0)
+        fluid = ~solid
+        roll = np.roll
+
+        # x方向
+        phi_xp = roll(phi, -1, axis=0); xp_solid = roll(solid, -1, axis=0)
+        phi_xm = roll(phi, +1, axis=0); xm_solid = roll(solid, +1, axis=0)
+        # +x 側が固体なら φ_{i+1} = φ_i + g*dx,  g = -Ux
+        phi_xp[ xp_solid & fluid ] = phi[ xp_solid & fluid ] + (-Ux)*self.grid.dx
+        # -x 側が固体なら φ_{i-1} = φ_i + g*dx,  ただし n=-ex → g=+Ux
+        phi_xm[ xm_solid & fluid ] = phi[ xm_solid & fluid ] + (+Ux)*self.grid.dx
+        dudx = (phi_xp - phi_xm) / (2*self.grid.dx)
+
+        # y方向
+        phi_yp = roll(phi, -1, axis=1); yp_solid = roll(solid, -1, axis=1)
+        phi_ym = roll(phi, +1, axis=1); ym_solid = roll(solid, +1, axis=1)
+        phi_yp[ yp_solid & fluid ] = phi[ yp_solid & fluid ] + (-Uy)*self.grid.dy
+        phi_ym[ ym_solid & fluid ] = phi[ ym_solid & fluid ] + (+Uy)*self.grid.dy
+        dvdy = (phi_yp - phi_ym) / (2*self.grid.dy)
+
+        # z方向
+        phi_zp = roll(phi, -1, axis=2); zp_solid = roll(solid, -1, axis=2)
+        phi_zm = roll(phi, +1, axis=2); zm_solid = roll(solid, +1, axis=2)
+        phi_zp[ zp_solid & fluid ] = phi[ zp_solid & fluid ] + (-Uz)*self.grid.dz
+        phi_zm[ zm_solid & fluid ] = phi[ zm_solid & fluid ] + (+Uz)*self.grid.dz
+        dwdz = (phi_zp - phi_zm) / (2*self.grid.dz)
+
+        # 速度は u = ∇φ
+        u = dudx; v = dvdy; w = dwdz
+        # 固体内はゼロ
+        u[solid] = v[solid] = w[solid] = 0.0
+        return u, v, w
     
     def _world_to_body(self, X, Y, Z):
         """ワールド座標系から物体座標系への変換（回転対応）"""
@@ -490,87 +517,81 @@ class GeometricBernoulli3D:
         cx = 1.0/dx**2
         cy = 1.0/dy**2
         cz = 1.0/dz**2
-        diag = 2*cx + 2*cy + 2*cz
 
-        # 1) まず全流体セルで中心の係数を置く
+        # 全流体セルで係数を組み立て
         ii, jj, kk = np.nonzero(fluid_mask)
         for (i,j,k) in zip(ii, jj, kk):
             p = linid[i,j,k]
-            # 対角
-            row.append(p); col.append(p); data.append(diag)
+            diag = 0.0  # 各方向の面を見ながら積み上げていく
 
-            # x+ 隣接
+            # ---- x+ 面 ----
+            diag += cx
             if i+1 < nx and fluid_mask[i+1,j,k]:
                 q = linid[i+1,j,k]
                 row.append(p); col.append(q); data.append(-cx)
             else:
-                # Neumann: 外枠 or 固体に面している → ゴースト置換で RHS へ
-                # 外枠は g=0 → 係数修正のみ
-                # 固体面は g = -U·n, ここでは n=+ex → g = -Ux
-                if i+1 == nx or solid_mask[i+1,j,k]:
-                    g = 0.0
-                    if i+1 < nx and solid_mask[i+1,j,k]:
-                        g = -Ux
-                    b[p] += 2.0 * g / dx
+                # solid or box boundary
+                if i+1 < nx and solid_mask[i+1,j,k]:
+                    g = -Ux  # n = +ex
+                    b[p] += g / dx  # 係数は g/dx（2倍ではない）
 
-            # x- 隣接
+            # ---- x- 面 ----
+            diag += cx
             if i-1 >= 0 and fluid_mask[i-1,j,k]:
                 q = linid[i-1,j,k]
                 row.append(p); col.append(q); data.append(-cx)
             else:
-                if i-1 < 0 or solid_mask[i-1,j,k]:
-                    g = 0.0
-                    if i-1 >= 0 and solid_mask[i-1,j,k]:
-                        g = +Ux     # n=-ex なので g = -U·(-ex)= +Ux
-                    b[p] += 2.0 * g / dx
+                if i-1 >= 0 and solid_mask[i-1,j,k]:
+                    g = +Ux  # n = -ex
+                    b[p] += g / dx
 
-            # y+ 隣接
+            # ---- y+ 面 ----
+            diag += cy
             if j+1 < ny and fluid_mask[i,j+1,k]:
                 q = linid[i,j+1,k]
                 row.append(p); col.append(q); data.append(-cy)
             else:
-                if j+1 == ny or solid_mask[i,j+1,k]:
-                    g = 0.0
-                    if j+1 < ny and solid_mask[i,j+1,k]:
-                        g = -Uy
-                    b[p] += 2.0 * g / dy
+                if j+1 < ny and solid_mask[i,j+1,k]:
+                    g = -Uy  # n = +ey
+                    b[p] += g / dy
 
-            # y- 隣接
+            # ---- y- 面 ----
+            diag += cy
             if j-1 >= 0 and fluid_mask[i,j-1,k]:
                 q = linid[i,j-1,k]
                 row.append(p); col.append(q); data.append(-cy)
             else:
-                if j-1 < 0 or solid_mask[i,j-1,k]:
-                    g = 0.0
-                    if j-1 >= 0 and solid_mask[i,j-1,k]:
-                        g = +Uy
-                    b[p] += 2.0 * g / dy
+                if j-1 >= 0 and solid_mask[i,j-1,k]:
+                    g = +Uy  # n = -ey
+                    b[p] += g / dy
 
-            # z+ 隣接
+            # ---- z+ 面 ----
+            diag += cz
             if k+1 < nz and fluid_mask[i,j,k+1]:
                 q = linid[i,j,k+1]
                 row.append(p); col.append(q); data.append(-cz)
             else:
-                if k+1 == nz or solid_mask[i,j,k+1]:
-                    g = 0.0
-                    if k+1 < nz and solid_mask[i,j,k+1]:
-                        g = -Uz
-                    b[p] += 2.0 * g / dz
+                if k+1 < nz and solid_mask[i,j,k+1]:
+                    g = -Uz  # n = +ez
+                    b[p] += g / dz
 
-            # z- 隣接
+            # ---- z- 面 ----
+            diag += cz
             if k-1 >= 0 and fluid_mask[i,j,k-1]:
                 q = linid[i,j,k-1]
                 row.append(p); col.append(q); data.append(-cz)
             else:
-                if k-1 < 0 or solid_mask[i,j,k-1]:
-                    g = 0.0
-                    if k-1 >= 0 and solid_mask[i,j,k-1]:
-                        g = +Uz
-                    b[p] += 2.0 * g / dz
+                if k-1 >= 0 and solid_mask[i,j,k-1]:
+                    g = +Uz  # n = -ez
+                    b[p] += g / dz
 
-        # 2) ゲージ固定：最初の流体セルをピン留め
-        row.append(0); col.append(0); data.append(1e6)   # 大きめ係数で固定
-        b[0] = 0.0
+            # ここで対角を1回だけ push
+            row.append(p); col.append(p); data.append(diag)
+
+        # ゲージ固定：最初の流体セルを完全に置換
+        p0 = 0
+        row.append(p0); col.append(p0); data.append(1.0)
+        b[p0] = 0.0
 
         A = coo_matrix((data,(row,col)), shape=(N,N))
         return A, b
@@ -686,6 +707,30 @@ class GeometricBernoulli3D:
         
         return phi, Ux, Uy, Uz  # 速度成分も返す
     
+    def _poisson_fullbox_neumann(self, rhs):
+        """フルボックスNeumann境界条件でのポアソン方程式（DCT高速版）"""
+        # Neumann での整合性: 右辺平均をゼロ化
+        rhs = rhs.copy()
+        rhs -= rhs.mean()
+        
+        if not HAS_DCT:
+            # フォールバック：既存のJacobiソルバー
+            return self._solve_poisson_3d(rhs, max_iter=300, tol=1e-8)
+
+        from scipy.fft import dctn, idctn
+        nx, ny, nz = rhs.shape
+        R = dctn(rhs, type=2, norm='ortho')
+        kx = np.arange(nx); ky = np.arange(ny); kz = np.arange(nz)
+        lamx = 2*(1-np.cos(np.pi*kx/nx)) / self.grid.dx**2
+        lamy = 2*(1-np.cos(np.pi*ky/ny)) / self.grid.dy**2
+        lamz = 2*(1-np.cos(np.pi*kz/nz)) / self.grid.dz**2
+        Lx, Ly, Lz = np.meshgrid(lamx, lamy, lamz, indexing='ij')
+        L = Lx + Ly + Lz
+        L[0,0,0] = 1.0
+        P = R / L
+        P[0,0,0] = 0.0
+        return idctn(P, type=3, norm='ortho')
+    
     def _hodge_projection(self, u: np.ndarray, v: np.ndarray, 
                          w: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Hodge投影による発散ゼロ速度場の生成
@@ -695,8 +740,8 @@ class GeometricBernoulli3D:
         # 発散計算
         div_u = self._compute_divergence(u, v, w)
         
-        # ポアソン方程式を解く（簡易Jacobi法）
-        psi = self._solve_poisson_3d(div_u, max_iter=100)
+        # ポアソン方程式を解く（DCT高速版）
+        psi = self._poisson_fullbox_neumann(div_u)
         
         # 速度補正
         grad_psi_x = np.gradient(psi, self.grid.dx, axis=0)
