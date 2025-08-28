@@ -495,11 +495,31 @@ def physics_step_lambda_native(
         velocity_term = jnp.sum(w[:,None] * dv, axis=0) / w_sum
         thermal_term  = jnp.sum(w[:,None] * (dT[:,None] * dr / (dist**2)), axis=0) / w_sum
         
+        # 圧力勾配力の計算（剥離の主要因）
+        # 密度差は実質的に圧力差を表す
+        # ベクトル化版（JIT対応）
+        dr_vec = neighbor_positions - state.position[i][None, :]  # (N_neighbors, 3)
+        dr_norm = jnp.linalg.norm(dr_vec, axis=1, keepdims=True) + 1e-8  # (N_neighbors, 1)
+        drho_local = (neighbor_rho_T - state.rho_T[i])[:, None]  # (N_neighbors, 1)
+        
+        # 各近傍からの圧力勾配寄与（重み付き）
+        pressure_contrib = -w[:, None] * drho_local * dr_vec / (dr_norm**2)  # (N_neighbors, 3)
+        pressure_contrib = jnp.where(valid_neighbors[:, None], pressure_contrib, 0.0)
+        
+        # 圧力勾配の重み付き平均
+        pressure_gradient = jnp.sum(pressure_contrib, axis=0) / (w_sum + 1e-8)
+        
+        # 圧力勾配による加速度（物理的に重要！）
+        a_pressure = -10.0 * pressure_gradient  # 係数は調整可能
+        
         # 近傍からの"加速度"を作る（係数は控えめ）
         a_int = config.interaction_strength * (velocity_term + 0.2*density_term + 0.02*thermal_term) / config.interaction_tau
         
         # マップへの緩和も"加速度"で
         a_map = (ideal_Lambda_F - current_velocity) / config.map_relax_tau
+        
+        # 全加速度の合成（圧力勾配を追加）
+        a_total = a_map + a_int + a_pressure
         
         # 剥離判定（緩和版）
         velocity_deficit = jnp.linalg.norm(ideal_Lambda_F - current_velocity)
@@ -509,7 +529,7 @@ def physics_step_lambda_native(
         is_separated = velocity_deficit > (config.separation_threshold * 100.0)  # 0.5m/sまで許容
         
         # 速度更新（加速度×dt）
-        new_Lambda_F = current_velocity + config.dt * (a_map + a_int)
+        new_Lambda_F = current_velocity + config.dt * a_total
         
         # 適応的粘性減衰（物理的に正しい実装）
         # 理想流からの偏差に基づく減衰
