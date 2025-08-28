@@ -512,25 +512,25 @@ class GeometricBernoulli3D:
             out[solid_mask] = 0.0
             return out
         
-        # === 2. 右辺ベクトルbの構築（迎角対応, 係数: 2g/Δ） ===
+        # === 2. 右辺ベクトルbの構築（迎角対応、正しい符号）===
         b = np.zeros((nx, ny, nz), dtype=np.float64)
         
         # 境界条件: ∂ϕ/∂n = g = -U·n
-        # ゴーストセル法では係数は 2g/Δ になる
-        # X面での寄与: g = -Ux
+        # ゴーストセル法での正しい離散化
+        # X面での寄与（両面とも同符号！）
         if abs(Ux) > 1e-10:
-            b[solid_plus_x] += (-2.0 * Ux) / dx   # +x面: n=+ex
-            b[solid_minus_x] += (+2.0 * Ux) / dx  # -x面: n=-ex
+            b[solid_plus_x] += Ux / dx   # +x面
+            b[solid_minus_x] += Ux / dx  # -x面
             
-        # Y面での寄与: g = -Uy
+        # Y面での寄与
         if abs(Uy) > 1e-10:
-            b[solid_plus_y] += (-2.0 * Uy) / dy   # +y面: n=+ey
-            b[solid_minus_y] += (+2.0 * Uy) / dy  # -y面: n=-ey
+            b[solid_plus_y] += Uy / dy   # +y面
+            b[solid_minus_y] += Uy / dy  # -y面
             
-        # Z面での寄与: g = -Uz
+        # Z面での寄与
         if abs(Uz) > 1e-10:
-            b[solid_plus_z] += (-2.0 * Uz) / dz   # +z面: n=+ez
-            b[solid_minus_z] += (+2.0 * Uz) / dz  # -z面: n=-ez
+            b[solid_plus_z] += Uz / dz   # +z面
+            b[solid_minus_z] += Uz / dz  # -z面
         
         # === 2.5 Neumann整合性（右辺の平均ゼロ化） ===
         b_mean = b[fluid_mask].mean()
@@ -610,8 +610,8 @@ class GeometricBernoulli3D:
                    (phi_yp - 2*phi + phi_ym) / dy**2 +
                    (phi_zp - 2*phi + phi_zm) / dz**2)
             
-            # 固体セルはAφ=φ（恒等）として解空間から外す
-            Aphi[solid_mask] = phi[solid_mask]
+            # 固体セルは0（流体領域のみ作用）
+            Aphi[solid_mask] = 0.0
             
             return Aphi
         
@@ -631,9 +631,12 @@ class GeometricBernoulli3D:
         p = z.copy()
         rz_old = np.sum(r * z)
         
+        # 初期残差ノルム
+        r0_norm = max(np.linalg.norm(r), 1e-30)
+        print(f"      Initial residual: ||r0||₂ = {r0_norm:.2e}")
+        
         tol = 1e-8
         max_iter = 300
-        b_norm = np.linalg.norm(b) + 1e-30
         
         for iteration in range(1, max_iter + 1):
             Ap = project_fluid(apply_laplacian(p))
@@ -643,7 +646,7 @@ class GeometricBernoulli3D:
             r = project_fluid(r - alpha * Ap)
             
             res_norm = np.linalg.norm(r)
-            rel_res = res_norm / b_norm
+            rel_res = res_norm / r0_norm  # 初期残差に対する相対値
             
             if rel_res <= tol:
                 print(f"        Converged at iteration {iteration}, rel_residual = {rel_res:.2e}")
@@ -663,9 +666,9 @@ class GeometricBernoulli3D:
         phi -= phi_mean
         print(f"        Gauge fixing: subtracted mean = {phi_mean:.2e}")
         
-        # 発散チェック
-        div_check = apply_laplacian(phi) - b
-        print(f"        Final: ||Aϕ - b||₂ = {np.linalg.norm(div_check):.2e}")
+        # 最終残差（流体領域のみ）
+        final_res = np.linalg.norm(project_fluid(apply_laplacian(phi) - b))
+        print(f"        Final: ||P(Aϕ - b)||₂ = {final_res:.2e}")
         
         return phi, Ux, Uy, Uz  # 速度成分も返す
     
